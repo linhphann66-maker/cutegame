@@ -1,0 +1,389 @@
+import {randomUUID} from 'node:crypto';
+import * as Game from '../src/model.ts';
+import {ContextGearSelection} from '../src/context-gear.ts';
+import {CombatSimulation,BASE_SKILLS,SPECIALS,DZ,shareableDecoys,decoyPoint,attackRange} from '../src/combat.ts';
+import {spawnRoomMonsters,stepMonsters} from './monster-sim.mjs';
+import {ENEMY_TYPES} from '../src/enemy-types.ts';
+import {enemyRoster} from '../src/enemy-roster.ts';
+import {createEnvironmentLayout,EnvironmentSimulation} from '../src/environments.ts';
+import {beginTitanAttack,stepTitanAttack,titanTelegraphs,isTitanSkill} from '../src/titan-patterns.ts';
+import {BOSS_SKILLS,BOSS_WINDUPS,bossTelegraphs,bossPhase,hitControl,BOSS_RESISTED,RESIST_SLOW,liftHeight} from '../src/boss-patterns.ts';
+import {atHome,homeRecoveryBonus} from '../src/home-care.ts';
+import {trailSpot,dogTossFactor,DOG_TOSS_CD} from '../src/guard-dog.ts';
+import {commandHash} from './action-service.mjs';
+import {gearFactor,skillLevel,skillCooldown} from '../src/upgrades.ts';
+import {clearJourney} from './adventure-lifecycle.mjs';
+import {inSafeZone} from '../src/safe-zone.ts';
+import {noteProgress} from './ranking.mjs';
+import {createColossusAuthority} from './colossus-authority.mjs';
+import {COLOSSUS_STATS,COLOSSUS_TYPE} from '../src/colossus-content.ts';
+import {colossusDamage} from '../src/colossus-patterns.ts';
+import {grantColossusReward} from '../src/colossus-rewards.ts';
+
+const dist=(a,b)=>Math.hypot(a.x-b.x,a.z-b.z);
+const finite=(value,fallback=0,min=-160,max=160)=>Number.isFinite(value)?Math.max(min,Math.min(max,value)):fallback;
+const snapshot=enemy=>{const {roster,home,changedAt,deadUntil,generation,pending,contributors,scaled,damageAt,cast,nextCastAt,hostPhase,hostAttackCount,combatAttacks,lastHitAt,...publicState}=enemy;return {...publicState,chaseGrace:Math.max(0,Math.min(4,((lastHitAt||0)+4000-Date.now())/1000))};};
+const STATUS=['fear','charm','slow','blind','sheep','taunt'];
+
+/** The browser host animates navigation; the server owns HP, skill timing, stats, kills and rewards. */
+export function createCombatAuthority({store,peers,rooms,remember,send,broadcast,onDeath=()=>{},onError=()=>{},colossusClock}){
+  const engines=new Map(),queues=new Map();let stopped=false;
+  // The daily world boss in home rooms (colossus-authority.mjs); its hits, kill and rewards go through the paths below.
+  const colossus=createColossusAuthority({send,broadcast,peers,...(colossusClock?{clock:colossusClock}:{})});colossus.setMaxHp(peer=>Game.maxHp(peer.account.profile));
+  function queue(id,task){const next=(queues.get(id)||Promise.resolve()).catch(()=>{}).then(task);queues.set(id,next);return next;}
+  async function internal(actorId,type,relatedIds,run,requestId=randomUUID(),outbox=true,retryContext={}){
+    return queue(actorId,async()=>{
+      for(let retry=0;retry<5;retry++){
+        const account=await store.get(actorId);if(!account)return null;
+        // Health retains this context with its batch even when commit succeeded but publishing the reply failed.
+        retryContext.originalRevision??=account.profileRevision||0;
+        try{
+          const committed=await store.command({actorId,requestId,hash:commandHash({type,requestId}),expectedRevision:account.profileRevision||0,originalRevision:retryContext.originalRevision,actionType:type,relatedIds,run,outbox});
+          // A successful commit may outlive its connection. Receipt replay has no changed
+          // records, but connected peers still need the persisted HP and life metadata.
+          if(committed.reply.replayed)committed.accounts=(await Promise.all([...new Set([actorId,...relatedIds])].map(id=>store.get(id)))).filter(Boolean);
+          committed.accounts.forEach(value=>{const current=remember(value),peer=peers.get(value.id);if(peer)send(peer.socket,{type:'profile',profile:current.profile,revision:current.profileRevision,authorityVersion:1});});
+          return committed;
+        }catch(error){if(error.status===409&&retry<4)continue;throw error;}
+      }
+    });
+  }
+  function state(room){if(!room.combat){const planet=room.id.split(':').at(-1),environment=new EnvironmentSimulation(createEnvironmentLayout(planet));environment.time=Date.now()/1000;environment.weather.time=environment.time;room.combat={planet,roster:new Map(enemyRoster(planet).map(e=>[e.id,e])),enemies:new Map(),environment,id:randomUUID(),at:Date.now(),lastBroadcast:0,lastMonsterBroadcast:0};room.combat.scale=Game.hardScale(peers.get(room.host)?.account.profile);spawnRoomMonsters(room.combat);}return room.combat;}
+  /** Đẩy snapshot quái mới nhất vào room.enemies để gửi cho client mới vào (joined). */
+  function snapshotRoom(room){publish(room);return room.enemies;}
+  function publish(room){
+    const now=Date.now();
+    for(const enemy of state(room).enemies.values())if(enemy.combatAttacks){
+      enemy.titanAttacks=enemy.combatAttacks.filter(c=>!c.done&&c.attack).map(c=>structuredClone(c.attack));
+      const pending=enemy.combatAttacks.find(c=>!c.done&&now<c.startsAt);
+      if(pending){enemy.phase='windup';enemy.phaseTime=(pending.startsAt-now)/1000;enemy.skill=pending.skill;enemy.telegraphs=pending.marks.map(mark=>({...mark}));}
+    }
+    room.enemies=[...state(room).enemies.values()].map(snapshot);
+  }
+  function health(room,enemy,impact){publish(room);broadcast(room,{...snapshot(enemy),type:'ENTITY_DAMAGED',targetId:enemy.id,currentHp:Math.max(0,enemy.hp),damageDealt:impact&&Number.isFinite(impact.amount)?impact.amount:0,enemyType:enemy.type,impact,...(impact?{impactId:randomUUID()}:{})});}
+  const aliveTargets=room=>[...room.members].map(id=>peers.get(id)).filter(p=>p&&p.active&&!p.visit&&p.account.profile.hp>0&&!inSafeZone(p.pose,p.planet));
+  const randomFor=seed=>()=>{seed=(Math.imul(seed,1664525)+1013904223)>>>0;return seed/4294967296;};
+  /**
+   * Boss tung skill đặc biệt: SERVER tự chọn thời điểm (thay cho host-client báo windup).
+   * Được gọi từ monster-sim khi boss vào windup và hết cooldown cast.
+   */
+  function beginCast(room,enemy,skill,now){
+    if(!enemy.boss||!BOSS_SKILLS[enemy.type]?.includes(skill)||enemy.hp<=0||now<(enemy.nextCastAt||0)||enemy.cast)return;
+    const attackCount=enemy.attackCount||0;
+    const targets=aliveTargets(room),target=targets.sort((a,b)=>dist(a.pose,enemy)-dist(b.pose,enemy))[0];if(!target||dist(target.pose,enemy)>35)return;
+    const source={x:enemy.x,z:enemy.z,radius:enemy.radius,facing:finite(enemy.facing,0,-100,100)},players=targets.map(p=>({id:p.account.id,x:p.pose.x,z:p.pose.z,airborne:engineFor(p).sim.statuses.flight>0}));
+    const telegraphPhase=enemy.type==='dragon'?bossPhase(enemy.hp,enemy.maxHp):enemy.hp<enemy.maxHp*.5?2:1;
+    const marks=isTitanSkill(skill)?titanTelegraphs(skill,source,target.pose,players,randomFor(attackCount*91571)):bossTelegraphs(skill,source,target.pose,telegraphPhase,attackCount);
+    if(skill==='rain')for(const p of players)if(dist(p,target.pose)>.05&&dist(p,enemy)<22)marks.push(...bossTelegraphs(skill,source,p,telegraphPhase,attackCount+marks.length));
+    const phase=enemy.type==='dragon'?bossPhase(enemy.hp,enemy.maxHp):1;
+    if(phase>=2&&(skill==='slam'||skill==='rain')){
+      const random=randomFor(attackCount*9127),environment=state(room).environment;
+      players.filter(p=>dist(p,enemy)<=25).forEach((p,index)=>{for(let i=0;i<(phase>=3?5:3);i++){const angle=random()*Math.PI*2,r=random()*4;environment.addFireRain({x:p.x+Math.cos(angle)*r,z:p.z+Math.sin(angle)*r},`dragon:${enemy.generation}:${attackCount}:${index}:${i}`);}});
+    }
+    const windup=BOSS_WINDUPS[skill]*(enemy.hp<enemy.maxHp*.3?.8:1),cooldown=ENEMY_TYPES[enemy.type].cooldown*(enemy.hp<enemy.maxHp*.5?.7:1)*(enemy.hp<enemy.maxHp*.3?.6:1)*(phase>=3?.8:1);
+    enemy.cast={skill,source,marks,startsAt:now+windup*1000,elapsed:0,fired:[],shots:[],attack:null};
+    // A new wind-up must not erase lingering orbs, poison pools or shockwaves.
+    (enemy.combatAttacks??=[]).push(enemy.cast);enemy.nextCastAt=now+(windup+cooldown)*1000;
+  }
+  function hurtPlayer(peer,amount,source='melee'){
+    const e=engineFor(peer),now=Date.now();// Nothing hurts an explorer standing in the safe zone round the cottage (safe-zone.ts), whatever the host reports.
+    if(peer.visit||!peer.active||peer.account.profile.hp<=0||inSafeZone(peer.pose,peer.planet)||now-e.damageAt<550||e.sim.invulnerable||source==='melee'&&e.sim.statuses.flight>0)return;
+    e.damageAt=now;const defense=Game.defense(combatProfile(peer))+e.sim.defenseBonus+(e.sim.statuses.armor>0?80:0);hp(peer,-Math.max(1,Math.round(amount*60/(defense+60))),source);
+  }
+  function hurtEnemyTarget(peer,enemy,multiplier,source='melee'){
+    // The knight's raised shield, facing the creature, stops the blow; a shot it stops flies back and hits the shooter (combat.reflect).
+    const sim=engineFor(peer).sim;if(sim.blocks(enemy)){if(source==='shot'&&!peer.visit&&peer.active)sim.reflect(enemy,dist(peer.pose,enemy)/DZ.block.speed);return;}
+    hurtPlayer(peer,enemy.damage*multiplier,source);
+  }
+  /**
+   * A creature's blow, shot or area reached one of `peer`'s summons (the room host reports it; combat.ts SUMMON_HP).
+   * The server's own copy of the summon decides: the reported id, else the same explorer's live summon nearest the
+   * creature; it must be within the creature's reach (a shot: its flight). Its new health goes to its explorer.
+   */
+  function hurtDecoy(peer,enemy,decoyId,multiplier,source='melee',trusted=false){
+    if(peer.visit||!peer.active)return false;const sim=engineFor(peer).sim,list=sim.decoys();if(!list.length)return false;
+    const def=ENEMY_TYPES[enemy.type],reach=source==='shot'?20:(def?.reach??1.5)+enemy.radius+3;
+    const near=d=>trusted||dist(decoyPoint(d,enemy),enemy)<=reach+d.r;
+    const decoy=list.find(d=>d.id===decoyId&&near(d))??list.filter(near).sort((a,b)=>dist(decoyPoint(a,enemy),enemy)-dist(decoyPoint(b,enemy),enemy))[0];
+    if(!decoy)return false;sim.hurtAlly(decoy.id,enemy.damage*multiplier);
+    const left=sim.allies.find(a=>a.id===decoy.id)?.hp??0;send(peer.socket,{type:'decoyHp',id:decoy.id,kind:decoy.kind,x:decoy.x,z:decoy.z,hp:left});return true;
+  }
+  /** The summons `peer` shares with the room (server.mjs pose), from the server's own simulation, checked by combat.ts shareableDecoys. */
+  function decoys(peer){return peer.visit||!peer.active?[]:shareableDecoys(engineFor(peer).sim.decoys(),peer.pose);}
+  /** A Colossus blow: the same gates as hurtPlayer, through only a quarter of the defence (colossusDamage). */
+  function hurtColossus(peer,multiplier,factor,roll){
+    const e=engineFor(peer),now=Date.now();if(peer.visit||!peer.active||peer.account.profile.hp<=0||inSafeZone(peer.pose,peer.planet)||now-e.damageAt<550||e.sim.invulnerable)return false;
+    e.damageAt=now;const defense=Game.defense(combatProfile(peer))+e.sim.defenseBonus+(e.sim.statuses.armor>0?80:0);hp(peer,-colossusDamage(COLOSSUS_STATS.atk,multiplier,defense,factor,roll),'melee');return true;
+  }
+  function updateCast(room,enemy,dt,now){
+    if(enemy.hp<=0||enemy.pending)return;
+    for(const cast of enemy.combatAttacks??[])updateAttack(room,enemy,cast,dt,now);
+    enemy.combatAttacks=(enemy.combatAttacks??[]).filter(c=>!c.done);enemy.cast=enemy.combatAttacks.at(-1)??null;
+  }
+  function updateAttack(room,enemy,c,dt,now){
+    if(now<c.startsAt)return;
+    const targets=aliveTargets(room),points=targets.map(p=>({id:p.account.id,x:p.pose.x,z:p.pose.z,airborne:engineFor(p).sim.statuses.flight>0}));c.elapsed+=dt;
+    const once=(id,time,fn)=>{if(c.elapsed>=time&&!c.fired.includes(id)){c.fired.push(id);fn();}};
+    const area=(p,r,multiplier,source='melee',inner=-1)=>{for(const peer of targets){const d=dist(peer.pose,p);if(d<r&&d>inner)hurtEnemyTarget(peer,enemy,multiplier,source);for(const decoy of engineFor(peer).sim.decoys()){const q=dist(decoyPoint(decoy,p),p);if(q<r&&q>inner)hurtDecoy(peer,enemy,decoy.id,multiplier,source,true);}}};
+    if(isTitanSkill(c.skill)){
+      c.attack??=beginTitanAttack(c.skill,c.source,c.marks,points);const result=stepTitanAttack(c.attack,dt,enemy,points);
+      for(const hit of result.hits){const target=peers.get(hit.id);if(target?.room===room.id)hurtEnemyTarget(target,enemy,hit.multiplier,hit.source);}
+      if(result.move){enemy.x=result.move.x;enemy.z=result.move.z;enemy.titanLift=result.move.y;}
+      if(result.summon)[...state(room).enemies.values()].filter(e=>e!==enemy&&e.hp>0&&!e.pending&&!e.roster.dormant&&!e.boss&&ENEMY_TYPES[e.type].speed>0&&dist(e,enemy)<60).slice(0,4).forEach((e,i)=>{const angle=c.source.facing+(i+.5)*Math.PI/2;e.x=enemy.x+Math.sin(angle)*(enemy.radius+2);e.z=enemy.z+Math.cos(angle)*(enemy.radius+2);e.hp=e.maxHp;e.damage*=1.3;e.phase='chase';e.lastHitAt=now;health(room,e);});
+      if(result.done){c.done=true;if(c.skill==='leap')enemy.titanLift=0;}return;
+    }
+    if(c.skill==='slam')once(0,0,()=>area(enemy,4.8,1.6));
+    if(c.skill==='rain')once(0,0,()=>{for(const mark of c.marks)area(mark,mark.r,1.3,'shot');});
+    if(c.skill==='quake')for(let i=0;i<3;i++)once(i,.12+i*.32,()=>area(c.source,3+i*3+.4,1.1,'melee',3+i*3-2.4));
+    if(c.skill==='eclipse')once(0,0,()=>{area(enemy,7,.9,'shot');state(room).environment.eclipseUntil=state(room).environment.time+6;});
+    if(c.skill==='charge'&&c.elapsed<.8)for(const peer of targets)if(dist(peer.pose,enemy)<enemy.radius+.6&&!c.fired.includes(peer.account.id)){c.fired.push(peer.account.id);hurtEnemyTarget(peer,enemy,1.3);}
+    if(c.skill==='spin'&&c.elapsed<2.4)once(Math.floor(c.elapsed/.35),0,()=>area(enemy,3.4,.5));
+    if(c.skill==='barrage'){
+      once(0,0,()=>{const count=enemy.hp<enemy.maxHp*.5?20:14;for(let i=0;i<count;i++){const a=i/count*Math.PI*2+c.source.facing;c.shots.push({x:c.source.x,z:c.source.z,vx:Math.sin(a)*13,vz:Math.cos(a)*13,life:1.4});}});
+      for(const shot of c.shots){const from={x:shot.x,z:shot.z};shot.x+=shot.vx*dt;shot.z+=shot.vz*dt;shot.life-=dt;for(const peer of targets)if(shot.life>0&&segmentDistance(peer.pose,from,shot)<.65){hurtEnemyTarget(peer,enemy,1,'shot');shot.life=0;}}
+    }
+    if(c.elapsed>3)c.done=true;
+  }
+  function segmentDistance(p,a,b){const x=b.x-a.x,z=b.z-a.z,l=x*x+z*z,f=l?Math.max(0,Math.min(1,((p.x-a.x)*x+(p.z-a.z)*z)/l)):0;return Math.hypot(p.x-a.x-x*f,p.z-a.z-z*f);}
+  /** Hard difficulty follows the room host (difficulty.ts hardScale): when the host or the host's setting changes, the
+   * live creatures are rescaled by the ratio, keeping each one's share of health. */
+  function rescale(room,s){
+    const next=Game.hardScale(peers.get(room.host)?.account.profile),old=s.scale??next;s.scale=next;
+    if(old.hp===next.hp&&old.damage===next.damage)return;
+    const hp=next.hp/old.hp,damage=next.damage/old.damage;
+    for(const enemy of s.enemies.values()){enemy.baseMaxHp=Math.round(enemy.baseMaxHp*hp);enemy.maxHp=Math.round(enemy.maxHp*hp);enemy.hp=Math.min(enemy.maxHp,Math.round(enemy.hp*hp));enemy.baseDamage*=damage;enemy.damage*=damage;if(enemy.hp>0)health(room,enemy);}
+  }
+  function kill(room,enemy,killer,execute=false){
+    if(enemy.pending)return;enemy.pending=true;const now=Date.now(),requestId=randomUUID(),killPoint={x:enemy.x,z:enemy.z},killerEpoch=epoch(killer.account),contributorEpochs=new Map([...room.members].map(id=>[id,peers.get(id)?.account.adventureEpoch||0]));
+    const contributors=[...enemy.contributors].filter(([id,at])=>now-at<(enemy.type===COLOSSUS_TYPE?3600000:30000)&&room.members.has(id)&&peers.get(id)?.planet===state(room).planet).map(([id])=>id);
+    if(!contributors.includes(killer.account.id))contributors.push(killer.account.id);
+    internal(killer.account.id,'combatKill',contributors,records=>{
+      // The Hard bonus follows the room's creatures (the host's scale), not each contributor's own setting.
+      let loot=[];const bonus=Game.scaleReward(state(room).scale);
+      for(const id of contributors){const account=records.get(id);if(!account||(account.adventureEpoch||0)!==contributorEpochs.get(id))continue;const before=account.profile,profile=Game.parseSave(JSON.stringify(account.profile));if(!profile)continue;
+        const rolled=enemy.type===COLOSSUS_TYPE?grantColossusReward(profile,id===killer.account.id,Math.random,false,bonus):Game.grantDefeat(profile,enemy.type,enemy.roster.xp,enemy.boss,Math.random,false,bonus);if(id===killer.account.id)loot=rolled;
+        if(execute&&id===killer.account.id&&(account.lifeEpoch||0)===killerEpoch.life)profile.hp=Math.min(Game.maxHp(profile),profile.hp+Game.maxHp(profile)*.25);
+        account.profile=profile;noteProgress(account,before,profile,now); // weekly leaderboard counters (ranking.mjs)
+      }
+      const owner=records.get(killer.account.id);if(!owner||(owner.adventureEpoch||0)!==killerEpoch.adventure)return {enemyId:enemy.id,drops:[],execute:false};owner.drops=(owner.drops||[]).filter(d=>d.expiresAt>now);
+      const drops=loot.map(item=>({id:randomUUID(),ownerId:owner.id,item:item.id,count:item.count,room:room.id,planet:state(room).planet,x:killPoint.x,z:killPoint.z,owner:owner.id,releaseAt:now+10000,expiresAt:now+30000}));owner.drops.push(...drops);
+      return {enemyId:enemy.id,drops,execute};
+    },requestId).then(committed=>{
+      if(!committed)throw new Error('Missing killer');enemy.pending=false;enemy.hp=0;enemy.deadUntil=Date.now()+enemy.roster.respawn*1000;enemy.respawn=enemy.roster.respawn;enemy.titanAttacks=[];enemy.shots=[];enemy.skillEffects=[];enemy.telegraphs=[];enemy.combatAttacks=[];enemy.cast=null;
+      room.killed.add(enemy.id);health(room,enemy);broadcast(room,{type:'ENTITY_DIED',id:enemy.id,targetId:enemy.id,by:contributors,eventId:requestId});colossus.killed(room,enemy,killer.account.id);
+      for(const drop of committed.reply.result.drops)broadcast(room,{type:'dropSpawn',drop});
+      if(execute&&committed.reply.result.execute)send((peers.get(killer.account.id)||killer).socket,{type:'executeResult',id:enemy.id,requestId,ok:true,profile:committed.reply.profile,revision:committed.reply.revision});
+      if(enemy.type==='magmaslime')for(const [i,minion] of [...state(room).enemies.values()].filter(e=>e.type==='minislime'&&e.hp<=0&&!e.pending).slice(0,3).entries()){minion.x=enemy.x+Math.cos(i*Math.PI*2/3)*.9;minion.z=enemy.z+Math.sin(i*Math.PI*2/3)*.9;minion.hp=minion.maxHp;minion.deadUntil=0;minion.respawn=0;minion.generation++;health(room,minion);}
+    }).catch(()=>{enemy.pending=false;enemy.hp=Math.max(1,enemy.hp);health(room,enemy);send(killer.socket,{type:'error',message:'The reward could not be saved. Please try again.'});});
+  }
+  function hit(peer,enemy,impact,execute=false,hazard=false){
+    const room=rooms.get(peer.room);if(!room||peer.visit||enemy.hp<=0||enemy.pending)return 0;
+    if(!enemy.scaled&&enemy.boss){const players=[...room.members].map(id=>peers.get(id)).filter(p=>p&&!p.visit&&dist(p.pose,enemy)<28),level=Math.max(...players.map(p=>p.account.profile.level),1),difference=Math.max(0,level-enemy.roster.level);enemy.maxHp=Math.round(enemy.baseMaxHp*(1+.6*Math.max(0,players.length-1))*(enemy.type==='dragon'?1:1+difference*.12));enemy.hp=enemy.maxHp;enemy.damage=enemy.baseDamage*(enemy.type==='dragon'?1:(1+difference*.07)*(1+.1*Math.max(0,players.length-1)));enemy.scaled=true;}
+    const control=hitControl(enemy.boss,impact.stun||0);
+    if(!hazard&&!execute&&enemy.type==='magmaturtle')impact={...impact,amount:impact.amount*(enemy.phase==='recover'?2:.12)};
+    if(enemy.type===COLOSSUS_TYPE&&!hazard)impact={...impact,amount:colossus.incoming(room,enemy,peer,impact.amount)};
+    const dealt=Math.min(enemy.hp,Math.max(0,impact.amount));enemy.contributors.set(peer.account.id,Date.now());enemy.lastHitAt=Date.now();enemy.hp-=dealt;enemy.stun=Math.max(enemy.stun||0,control.stun);
+    if(control.slow)enemy.statuses.slow=Math.max(enemy.statuses.slow||0,control.slow);
+    if(impact.lift>0){enemy.liftVelocity=Math.max(enemy.liftVelocity||0,Math.sqrt(liftHeight(enemy.boss,impact.lift)*24));enemy.stun=Math.max(enemy.stun||0,.8);enemy.phase='chase';enemy.telegraphs=[];enemy.combatAttacks=(enemy.combatAttacks??[]).filter(c=>c.attack||c.elapsed>0);enemy.cast=enemy.combatAttacks.at(-1)??null;}
+    if(enemy.hp<=0){enemy.hp=1;kill(room,enemy,peer,execute);}health(room,enemy,impact);return dealt;
+  }
+  const epoch=account=>({adventure:account.adventureEpoch||0,life:account.lifeEpoch||0});
+  function hp(peer,amount,source){
+    if(!Number.isFinite(amount)||!amount||peer.visit)return;const engine=engineFor(peer),now=Date.now(),context=epoch(peer.account);
+    const last=engine.healthEvents.at(-1);
+    if(last&&last.adventure===context.adventure&&last.life===context.life&&last.planet===peer.planet&&Math.sign(last.amount)===Math.sign(amount)&&now-last.at<100)last.amount+=amount;
+    else engine.healthEvents.push({...context,amount,source,at:now,planet:peer.planet,x:peer.pose.x,z:peer.pose.z});
+  }
+  function flushHealth(engine){
+    if(engine.pendingHealth?.flushing)return engine.pendingHealth.promise;
+    if(!engine.pendingHealth&&!engine.healthEvents.length)return Promise.resolve(true);
+    const batch=engine.pendingHealth??={events:engine.healthEvents.splice(0),requestId:randomUUID(),context:epoch(engine.peer.account),flushing:false},events=batch.events,actorId=engine.peer.account.id;batch.flushing=true;engine.hpAt=Date.now();
+    return batch.promise=internal(actorId,'health',[],records=>{
+      const account=records.get(actorId),profile=account.profile;let delta=0,died=false;
+      for(const event of events){
+        if(event.adventure!==(account.adventureEpoch||0)||event.life!==(account.lifeEpoch||0)||event.at<(account.healthBoundaryAt||0))continue;
+        const before=profile.hp;profile.hp=Math.max(0,Math.min(Game.maxHp(profile),profile.hp+event.amount));delta+=profile.hp-before;
+        if(profile.hp<=0){profile.planet=event.planet;Game.die(profile,event.x,event.z);clearJourney(account);account.lifeEpoch=(account.lifeEpoch||0)+1;died=true;}
+      }
+      return {delta,died,lifeEpoch:account.lifeEpoch||0};
+    },batch.requestId,false,batch) /* bookkeeping: no event-outbox entry twice a second while hurt */.then(result=>{engine.pendingHealth=null;if(!result)return true;const live=peers.get(actorId);if(!live)return true;
+      if(result.reply.result.died){resetPeer(live,{newLife:true});onDeath(live);}
+      send(live.socket,{type:'healthResult',...result.reply.result});return true;
+    }).catch(async error=>{
+      if(error.status===410){
+        // The receipt was evicted: its outcome is ambiguous, so reload instead of applying old damage a second time.
+        try{const account=await store.get(actorId),live=peers.get(actorId);
+          if(account){const current=remember(account);if(live){send(live.socket,{type:'profile',profile:current.profile,revision:current.profileRevision,authorityVersion:1});if((account.adventureEpoch||0)===batch.context.adventure&&engine.reconciledLife.adventure===batch.context.adventure&&(account.lifeEpoch||0)>engine.reconciledLife.life){resetPeer(live,{newLife:true});onDeath(live);}}}
+          engine.pendingHealth=null;return true;
+        }catch{/* Keep the same batch identity until the authoritative state can be loaded. */}
+      }
+      batch.flushing=false;return false;
+    });
+  }
+  /** Settle already observed damage before an inventory action calculates healing. */
+  async function flushPeerHealth(peer){
+    const engine=engines.get(peer.account.id);if(!engine)return;
+    const pending=!!engine.pendingHealth,buffered=engine.healthEvents.length>0;
+    if(pending&&!await flushHealth(engine))throw new Error('Pending health could not be saved. Please try again.');
+    if(buffered&&!await flushHealth(engine))throw new Error('Pending health could not be saved. Please try again.');
+  }
+  function combatProfile(peer){
+    const engine=engineFor(peer),profile=peer.account.profile;engine.gear??=new ContextGearSelection();
+    const weapon=engine.gear.forCombat(profile);return {...profile,gear:{...profile.gear,...(weapon?{weapon}:{weapon:undefined})}};
+  }
+  function engineFor(peer){
+    let engine=engines.get(peer.account.id);
+    if(engine){
+      engine.peer=peer;engine.lastSeen=Date.now();
+      if(engine.room!==peer.room){flushHealth(engine);engine.sim.reset();engine.room=peer.room;}
+      if(engine.planet!==peer.planet){engine.planet=peer.planet;engine.environment=new EnvironmentSimulation(createEnvironmentLayout(peer.planet));}
+      return engine;
+    }
+    engine={peer,room:peer.room,planet:peer.planet,reconciledLife:epoch(peer.account),lastSeen:Date.now(),nextBasic:0,nextSkill:[0,0,0,0],healthEvents:[],hpAt:0,damageAt:0,lastSkill:new Map(),environment:new EnvironmentSimulation(createEnvironmentLayout(peer.planet))};
+    const current=()=>engine.peer,room=()=>rooms.get(current().room);
+    const targets=()=>room()?[...state(room()).enemies.values()]:[];
+    engine.sim=new CombatSimulation({position:()=>current().pose,facing:()=>current().pose.facing,face:a=>{current().pose.facing=a;},targets,
+      weapon:()=>{const weapon=Game.weaponStats(combatProfile(current()));return weapon.kind==='rod'?{kind:'fist',range:1.6,cd:.5,special:'fist'}:weapon;},
+      stats:()=>Game.activeStats(combatProfile(current())),moving:()=>current().pose.moving,
+      move:(x,z)=>{current().pose.x+=x;current().pose.z+=z;},hit:(target,impact)=>hit(current(),target,impact),
+      heal:fraction=>hp(current(),Game.maxHp(current().account.profile)*fraction,'heal'),
+      execute:target=>{const p=current();if(!target.boss&&target.hp/target.maxHp<.4&&dist(p.pose,target)<=3.2+target.radius)hit(p,target,{amount:target.hp,critical:true,stun:0,lift:0,knock:0,direction:{x:0,z:0}},true);},
+      effect:effect=>{if(room())broadcast(room(),{type:'effect',by:current().account.id,visual:effect},current().account.id);},
+      // The pet waits by the pen at home (pet-pen.ts petMayFight): it shoots only while its explorer is away from the safe village.
+      pet:()=>{const p=current(),id=p.account.profile.gear.pet,pet=Game.ITEMS[id]?.pet;return pet&&!p.visit&&!atHome(p.planet,p.pose)?{...pet,dmg:pet.dmg*gearFactor(p.account.profile,id),x:p.pose.x,z:p.pose.z}:null;},
+      // The guard dog throws only while the server says it follows (pose.dog is null at home and on visits); it stands at the trailing spot.
+      dog:()=>{const p=current();if(p.visit||typeof p.pose?.dog!=='number'||atHome(p.planet,p.pose))return null;const at=trailSpot(p.pose,p.pose.facing||0);return {x:at.x,z:at.z,dmg:dogTossFactor(p.account.profile.level),cd:DOG_TOSS_CD,target:p.target??null};},
+      skillLevel:index=>skillLevel(combatProfile(current()),index),
+      status:(target,kind,duration)=>{if(kind==='stun'){/* a freeze or a root holds bosses too */target.stun=Math.max(target.stun||0,duration);if(room())broadcast(room(),{type:'status',id:target.id,kind,duration});return;}if(target.boss&&BOSS_RESISTED.includes(kind)){kind='slow';duration*=RESIST_SLOW;}target.statuses[kind]=Math.max(target.statuses[kind]||0,duration);if(room())broadcast(room(),{type:'status',id:target.id,kind,duration});},
+      moveTarget:(target,x,z)=>{if(dist(target,{x,z})>12)return;target.x=x;target.z=z;if(room())broadcast(room(),{type:'moveEnemy',id:target.id,x,z});}});
+    engines.set(peer.account.id,engine);return engine;
+  }
+  function resetPeer(peer,{newLife=false,reason}={}){
+    const engine=engineFor(peer);engine.sim.reset();
+    if(newLife||reason==='rest')engine.healthEvents=[];
+    if(newLife){engine.reconciledLife=epoch(peer.account);engine.environment=new EnvironmentSimulation(createEnvironmentLayout(peer.planet));engine.damageAt=0;}
+    if(reason==='reset'){engine.nextBasic=0;engine.nextSkill=[0,0,0,0];}
+  }
+  /**
+   * PLAYER_ATTACK — client chỉ gửi hướng chém + vũ khí đang cầm; SERVER quyết định trúng ai.
+   * Kiểm tra: vũ khí khớp đồ đang đeo, tầm đánh, góc chém, cooldown, và chống tính 1 đòn
+   * 2 lần bằng requestId (invincibility/idempotency). Sát thương tính đúng công thức
+   * CombatSimulation.damage (crit, stealth/giant/marked/rally bonus, lifesteal).
+   */
+  function playerAttack(peer,msg={}){
+    const room=rooms.get(peer.room);
+    if(!room||peer.visit||!peer.active||peer.account.profile.hp<=0)return;
+    const now=Date.now(),e=engineFor(peer);
+    // Idempotency: 1 cú vung chỉ tính 1 lần dù client retry/reconnect gửi lại.
+    const requestId=typeof msg.requestId==='string'?msg.requestId.slice(0,80):'';
+    e.attackIds??=new Map();
+    if(requestId){
+      if(e.attackIds.has(requestId))return;
+      e.attackIds.set(requestId,now);
+      if(e.attackIds.size>500)e.attackIds.delete(e.attackIds.keys().next().value);
+      if(e.attackIds.size%50===0)for(const [id,at] of e.attackIds)if(now-at>30000)e.attackIds.delete(id);
+    }
+    if(now<e.nextBasic)return; // cooldown theo tốc độ đánh của vũ khí
+    // Vũ khí client khai báo phải khớp vũ khí đang đeo THẬT (chống giả mạo tầm/damage).
+    // Còn sát thương tính theo combatProfile: server tự đổi cần câu sang kiếm đang sở hữu (forCombat),
+    // giống hệt CombatSimulation server cũ.
+    const claimed=typeof msg.weaponId==='string'?msg.weaponId:'';
+    if(claimed!==(peer.account.profile.gear?.weapon||'fist'))return;
+    const profile=combatProfile(peer);
+    let weapon=Game.weaponStats(profile);
+    if(weapon.kind==='rod')weapon={kind:'fist',range:1.6,cd:.5,special:'fist'}; // không có kiếm thì đánh bằng tay
+    let angle=Number(msg.angle);
+    if(!Number.isFinite(angle))angle=Number(peer.pose.facing)||0;
+    angle=((angle+Math.PI)%(2*Math.PI)+2*Math.PI)%(2*Math.PI)-Math.PI;
+    const p=peer.pose,s=state(room);
+    const targets=[...s.enemies.values()].filter(t=>t.hp>0&&!t.pending);
+    if(!targets.length)return;
+    const dir={x:Math.sin(angle),z:Math.cos(angle)};
+    const stats=Game.activeStats(profile),sim=e.sim,struck=[];
+    if(weapon.kind==='gun'){
+      // Raycast: đạn bay thẳng, trúng con gần nhất trên đường bắn.
+      const range=(weapon.range??8)+1;
+      let best=null,bestAlong=Infinity;
+      for(const t of targets){
+        const rx=t.x-p.x,rz=t.z-p.z,along=rx*dir.x+rz*dir.z;
+        if(along<0||along>range+t.radius)continue;
+        if(Math.abs(rx*dir.z-rz*dir.x)>t.radius+.65)continue;
+        if(along<bestAlong){bestAlong=along;best=t;}
+      }
+      if(best)struck.push(best);
+    }else{
+      // Cận chiến: quái trong tầm + nằm trong góc chém (dot >= cos(halfArc)).
+      const threshold=weapon.kind==='sword'?(weapon.arc??.2):.5;
+      for(const t of targets){
+        const x=t.x-p.x,z=t.z-p.z,len=Math.hypot(x,z);
+        if(len>attackRange(weapon,t.radius))continue;
+        if(len>0&&(x*dir.x+z*dir.z)/len<threshold)continue;
+        struck.push(t);
+      }
+    }
+    if(!struck.length)return;
+    const multiplier=weapon.kind==='sword'?1.1:1;
+    let first=null;
+    for(const t of struck){
+      const critical=Math.random()<stats.critChance;
+      const bonus=(sim.statuses.giant>0?1.6:1)*(sim.statuses.stealth>0?DZ.stealth.bonus:1)*(sim.marked.has(t.id)?1.5:1)*((sim.statuses.rally??0)>0?1+DZ.torch.bonus:1);
+      sim.statuses.stealth=0;
+      const amount=Math.max(1,Math.round(stats.attack*multiplier*bonus*(critical?(stats.critDamage??2):1)*(.9+Math.random()*.2)));
+      const dealt=hit(peer,t,{amount,critical,stun:.15,lift:0,knock:1.2,direction:{x:dir.x,z:dir.z}});
+      if(stats.lifesteal>0&&dealt>0)hp(peer,Math.min(dealt*stats.lifesteal,stats.maxHp*.02),'lifesteal');
+      if(!first)first=t;
+    }
+    if(first)peer.target=first.id; // pet/chó hỗ trợ đánh tiếp mục tiêu này
+    e.nextBasic=now+Math.max(.12,(weapon.cd||.5)/Math.max(.2,1+stats.haste))*1000;
+  }
+  /** Wrapper cho tests/callsite cũ: aim về phía target rồi đi chung đường playerAttack. */
+  function basic(peer,targetId){
+    if(peer.visit||!peer.active||peer.account.profile.hp<=0)return;
+    const room=rooms.get(peer.room);if(!room)return;
+    const target=typeof targetId==='string'?state(room).enemies.get(targetId):null;
+    playerAttack(peer,{angle:target?Math.atan2(target.x-peer.pose.x,target.z-peer.pose.z):(peer.pose.facing||0),weaponId:peer.account.profile.gear?.weapon||'fist',requestId:randomUUID()});
+  }
+  function skill(peer,index){if(peer.visit||!peer.active||peer.account.profile.hp<=0||!Number.isInteger(index)||index<0||index>3)return;const e=engineFor(peer),now=Date.now();if(now<e.nextSkill[index])return;const profile=combatProfile(peer),dz=profile.gear.disguise,weapon=Game.weaponStats(profile),list=Game.DISGUISES[dz]?.skills||[...BASE_SKILLS,SPECIALS[weapon.special||'fist']||SPECIALS.fist];if(dz?e.sim.disguise(dz,index):e.sim.skill(index,weapon.special||'fist')){e.nextSkill[index]=now+skillCooldown(profile,index,list[index].cd,!!dz)/Math.max(.2,1+Game.activeStats(profile).haste)*1000;internal(peer.account.id,'skill',[],records=>{const s=records.get(peer.account.id).profile;Game.recordEvent(s,'skill');return {index};}).catch(()=>{});}}
+  function environmentSnapshot(env){return {time:env.time,lamps:[...env.lamps],eclipseUntil:env.eclipseUntil,nestLevel:env.nestLevel,fireRain:env.fireRain,lightning:env.lightning,weather:env.weather.snapshot()};}
+  function tick(dt=.05){
+    const now=Date.now();
+    for(const room of rooms.values()){
+      const s=state(room),active=[...room.members].map(id=>peers.get(id)).filter(p=>p&&p.active&&!p.visit),actors=[...s.enemies.values()].map(e=>({id:e.id,x:e.x,z:e.z,hp:e.hp,maxHp:e.maxHp,boss:e.boss,flying:ENEMY_TYPES[e.type]?.flying,lavaImmune:e.type==='lavaworm'}));
+      const liveDragon=[...s.enemies.values()].find(e=>e.type==='dragon'&&e.hp>0);s.environment.dragonPhase=liveDragon?bossPhase(liveDragon.hp,liveDragon.maxHp):0;
+      s.environment.nearbyPlayers=active.length;
+      const before=environmentSnapshot(s.environment),weatherBefore=structuredClone(before.weather),rainBefore=structuredClone(before.fireRain),lightningBefore=structuredClone(before.lightning);
+      const focus=active.length?active[(s.focusCursor=(s.focusCursor||0)+1)%active.length].pose:{x:0,z:0};
+      const step=s.environment.step(dt,focus,{x:0,z:0},{speed:6,maxHp:100,flying:true},actors);
+      for(const strike of step.enemyHits){const enemy=s.enemies.get(strike.id);if(!enemy||enemy.pending||enemy.hp<=0)continue;
+        const contributor=[...enemy.contributors].filter(([,at])=>now-at<30000).map(([id])=>peers.get(id)).find(p=>p?.room===room.id&&!p.visit);
+        if(contributor)hit(contributor,enemy,{amount:strike.amount,critical:false,stun:0,lift:0,knock:0,direction:{x:0,z:0}},false,true);
+        else{enemy.hp=Math.max(0,enemy.hp-strike.amount);if(enemy.hp===0){enemy.deadUntil=now+enemy.roster.respawn*1000;enemy.respawn=enemy.roster.respawn;enemy.shots=[];enemy.titanAttacks=[];enemy.combatAttacks=[];enemy.cast=null;}health(room,enemy);}
+      }
+      const dragon=[...s.enemies.values()].find(e=>e.type==='dragon');if(dragon&&step.dragonSummon){dragon.hp=dragon.maxHp;dragon.deadUntil=0;dragon.respawn=0;dragon.statuses={};dragon.stun=0;dragon.phase='idle';dragon.cast=null;dragon.combatAttacks=[];health(room,dragon);}if(dragon&&step.dragonDismiss){dragon.hp=0;dragon.deadUntil=Infinity;dragon.respawn=999999;dragon.cast=null;dragon.combatAttacks=[];dragon.titanAttacks=[];dragon.shots=[];dragon.skillEffects=[];dragon.telegraphs=[];health(room,dragon);}
+      colossus.tick(room,s,dt,{targets:()=>aliveTargets(room),hurt:hurtColossus,hurtTrue:(peer,amount)=>{if(!peer.visit&&peer.active&&peer.account.profile.hp>0)hp(peer,-amount,'hazard');}});
+      for(const enemy of s.enemies.values()){
+        if(enemy.hp>0&&!enemy.pending&&enemy.phase==='return'&&now-(enemy.lastHitAt||0)>4000){enemy.hp=Math.min(enemy.maxHp,enemy.hp+enemy.maxHp*.3*dt);if(enemy.hp===enemy.maxHp)enemy.scaled=false;}
+        updateCast(room,enemy,dt,now);
+        enemy.stun=Math.max(0,(enemy.stun||0)-dt);for(const key of STATUS)enemy.statuses[key]=Math.max(0,(enemy.statuses[key]||0)-dt);
+        if(enemy.hp<=0&&!enemy.pending&&Number.isFinite(enemy.deadUntil)){enemy.respawn=Math.max(0,(enemy.deadUntil-now)/1000);if(enemy.respawn===0&&active.every(p=>dist(p.pose,enemy.home)>22)){enemy.x=enemy.home.x;enemy.z=enemy.home.z;enemy.hp=enemy.maxHp=enemy.baseMaxHp;enemy.damage=enemy.baseDamage;enemy.scaled=false;enemy.contributors.clear();enemy.generation++;room.killed.delete(enemy.id);health(room,enemy);}}
+      }
+      room.environment=environmentSnapshot(s.environment);
+      rescale(room,s);
+      // Server tự mô phỏng AI quái 20Hz (monster-sim.mjs), thay cho snapshot của host-client.
+      stepMonsters(s,dt,now,{targets:()=>aliveTargets(room),hurt:(peer,enemy,mult,source)=>hurtEnemyTarget(peer,enemy,mult,source||'melee'),decoy:(peer,enemy,mult)=>hurtDecoy(peer,enemy,undefined,mult,'melee',true),cast:(enemy,skill)=>beginCast(room,enemy,skill,now)});
+      // Broadcast vị trí/trạng thái quái 10Hz để client nội suy mượt.
+      if(now-s.lastMonsterBroadcast>100){s.lastMonsterBroadcast=now;publish(room);broadcast(room,{type:'MONSTERS_UPDATE',monsters:room.enemies});}
+      if(now-s.lastBroadcast>250){s.lastBroadcast=now;publish(room);broadcast(room,{type:'environment',snapshot:room.environment});}
+      for(const peer of active){const e=engineFor(peer);e.sim.update(dt,true);e.environment.authoritative=false;e.environment.time=s.environment.time-dt;e.environment.weather.restore(weatherBefore);e.environment.fireRain=structuredClone(rainBefore);e.environment.lightning=structuredClone(lightningBefore);e.environment.lamps=new Map(s.environment.lamps);e.environment.eclipseUntil=s.environment.eclipseUntil;e.environment.dragonPhase=s.environment.dragonPhase;e.environment.nestLevel=before.nestLevel;
+        if(peer.account.ridePlanet===peer.planet&&peer.account.rideUntil>now)e.environment.rideUntil=e.environment.time+(peer.account.rideUntil-now)/1000;
+        const traits=Game.activeStats(peer.account.profile),hazard=e.environment.step(dt,peer.pose,{x:0,z:0},{...traits,fireResistance:traits.lavaproof?1:traits.fireResistance,flying:e.sim.statuses.flight>0||e.sim.statuses.bats>0},[]);
+        if(hazard.damage>0)hurtPlayer(peer,hazard.damage,'hazard');if(hazard.heal)hp(peer,hazard.heal,'heal');if(traits.regen>0&&peer.account.profile.hp<traits.maxHp)hp(peer,traits.regen*dt,'regen');if(atHome(peer.planet,peer.pose)&&peer.account.profile.hp<traits.maxHp)hp(peer,homeRecoveryBonus(traits.regen)*dt,'rest');
+
+      }
+    }
+    for(const[id,engine]of engines){if((engine.pendingHealth||engine.healthEvents.length)&&now-engine.hpAt>500)flushHealth(engine);if(!peers.has(id)&&!engine.pendingHealth&&!engine.healthEvents.length&&now-engine.lastSeen>600000)engines.delete(id);}
+  }
+  const timer=setInterval(()=>{if(!stopped)try{tick(.05);}catch(error){onError(error);}},50);timer.unref();
+  function bomb(peer,radius,multiplier){const room=rooms.get(peer.room);if(!room||peer.visit)return;for(const enemy of state(room).enemies.values())if(enemy.hp>0&&dist(peer.pose,enemy)<=radius+enemy.radius)hit(peer,enemy,{amount:Math.round(Game.attack(combatProfile(peer))*multiplier),critical:false,stun:.5,lift:0,knock:2,direction:{x:0,z:0}});}
+  return {basic,playerAttack,skill,hurtEnemyTarget,hurtDecoy,decoys,bomb,engineFor,state,snapshotRoom,beginCast,internal,resetPeer,flushPeerHealth,colossus,async close(){stopped=true;clearInterval(timer);for(const engine of engines.values())flushHealth(engine);await Promise.allSettled([...queues.values()]);}};
+}
