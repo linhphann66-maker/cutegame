@@ -1,0 +1,80 @@
+import { t } from './i18n.ts';
+import * as M from './model.ts';
+import { UPGRADES } from './content.ts';
+
+/**
+ * Data behind the market's "Sell all produce & fish" button and the wishing crystal's stat cards, kept out of main.ts so the
+ * numbers are testable. The reference's sell dialog sells every crop, fish and junk stack in one tap (bundle @939401); its
+ * crystal shows one card per stat with "Level n" and "Now: <value> • <gain>" (openUpgrade, table Nf).
+ */
+export const PRODUCE_TYPES = ['crop', 'fish', 'junk'] as const;
+
+const isProduce = (id: string) => (PRODUCE_TYPES as readonly string[]).includes(M.ITEMS[id]?.type) && M.ITEMS[id].sell > 0;
+/**
+ * Loose (unequipped) crop, fish and junk stacks that sell, with the energy they bring in total. At home the chest's
+ * produce counts too (`chest`, `fromChest`): the workers store their harvest there while the explorer is out.
+ */
+export function produceLots(s: M.SaveState) {
+  const lots = (Object.keys(s.bag) as M.ItemId[]).filter(isProduce).map(id => ({ id, n: M.looseQuantity(s, id) })).filter(l => l.n > 0);
+  const chest = s.planet === 'home' ? (Object.keys(s.chest) as M.ItemId[]).filter(isProduce).map(id => ({ id, n: s.chest[id] ?? 0 })).filter(l => l.n > 0) : [];
+  const total = [...lots, ...chest].reduce((sum, l) => sum + l.n * M.sellPrice(s, l.id), 0);
+  return { lots, chest, total, fromChest: chest.reduce((n, l) => n + l.n, 0) };
+}
+
+/** Sells every produce stack, the chest's too at home; returns the energy gained (0 when there was nothing to sell). */
+export function sellProduce(s: M.SaveState) {
+  const { lots, chest } = produceLots(s); let gained = 0;
+  for (const { id, n } of lots) gained += M.sell(s, id, n);
+  for (const { id, n } of chest) {
+    const value = M.sellPrice(s, id) * n;
+    if (!Number.isSafeInteger(s.energy + value) || !M.removeItem(s.chest, id, n)) continue;
+    s.energy += value; gained += value; M.recordEvent(s, 'sell', value);
+  }
+  return gained;
+}
+
+/**
+ * "Cook & sell all" (round 28): the same produce, but every stack the kitchen can cook (crops and fish with a cooked_
+ * form, content.ts) goes through the pot first, since a cooked dish sells for about 2.2x the raw price (+2). `raw` is
+ * what "Sell all" would bring, `cooked` what cooking first brings; both count the chest at home. Cooking follows the
+ * kitchen's own rule (model.ts cook: at home, kitchen open), so away from home or before the kitchen opens `kitchen` is
+ * false and only the raw value is on offer.
+ */
+export function cookSellPlan(s: M.SaveState) {
+  const { lots, chest, total } = produceLots(s), kitchen = s.planet === 'home' && M.kitchenOpen(s);
+  const cookable = (id: string) => kitchen && Object.hasOwn(M.ITEMS, `cooked_${id}`);
+  const cooked = [...lots, ...chest].reduce((sum, l) => sum + l.n * M.sellPrice(s, cookable(l.id) ? `cooked_${l.id}` : l.id), 0);
+  const dishes = [...lots, ...chest].reduce((n, l) => n + (cookable(l.id) ? l.n : 0), 0);
+  return { raw: total, cooked, kitchen, dishes };
+}
+/** Cooks every cookable produce stack (bag and chest), sells exactly those dishes, then sells the rest as "Sell all" does. */
+export function cookSellProduce(s: M.SaveState) {
+  const plan = cookSellPlan(s);
+  if (!plan.kitchen || !plan.raw) return 0;
+  const { lots, chest } = produceLots(s), ids = [...new Set([...lots, ...chest].map(l => l.id))].filter(id => Object.hasOwn(M.ITEMS, `cooked_${id}`));
+  let gained = 0;
+  for (const id of ids) {
+    const n = M.pantry(s, id);
+    if (n > 0 && M.cook(s, id, n)) gained += M.sell(s, `cooked_${id}`, n);
+  }
+  return gained + sellProduce(s);
+}
+
+/** Defence as the reference shows it: "N (−X% damage)", X = def / (def + 60), the same curve the hit formula uses. */
+export const defenseText = (def: number) => t('{defense} (−{percent}% damage)', { defense: def, percent: Math.round(def / (def + 60) * 100) });
+
+export type UpgradeKind = keyof typeof UPGRADES;
+export interface UpgradeCard { kind: UpgradeKind; icon: string; name: string; level: number; now: string; gain: string; cost: number; max: boolean; affordable: boolean }
+
+const GAIN: Record<UpgradeKind, string> = { health: '+25 max HP', attack: '+3 attack', defense: '+4 defense', crit: '+2.5% crit' };
+const rank = (s: M.SaveState, kind: UpgradeKind) => kind === 'health' ? s.healthUp : kind === 'attack' ? s.attackUp : kind === 'defense' ? s.defenseUp : s.critUp;
+
+/** One card per stat: icon, name, level, current value, the gain per level, and the price (or MAX at the cap). */
+export function upgradeCards(s: M.SaveState): UpgradeCard[] {
+  const stats = M.activeStats(s);
+  const now: Record<UpgradeKind, string> = { health: `${Math.round(stats.maxHp)}`, attack: stats.attack.toFixed(1), defense: defenseText(stats.defense), crit: `${Math.round(stats.critChance * 100)}%` };
+  return (Object.keys(UPGRADES) as UpgradeKind[]).map(kind => {
+    const def = UPGRADES[kind], level = rank(s, kind), max = 'max' in def && level >= def.max, cost = M.upgradeCost(s, kind);
+    return { kind, icon: def.icon, name: t(def.name), level, now: now[kind], gain: t(GAIN[kind]), cost, max, affordable: !max && s.energy >= cost };
+  });
+}

@@ -1,0 +1,165 @@
+/**
+ * Adaptive graphics quality. The renderer's cost on phones is dominated by the
+ * number of pixels drawn and by the shadow pass, not by triangle counts, so the
+ * governor first removes costly shadows and decorative density on phones,
+ * preserving image sharpness before reducing resolution if still necessary.
+ * The choice is stored per device, never in the shared save.
+ */
+export type QualityLevel = 'low' | 'medium' | 'high';
+export type QualitySetting = 'auto' | QualityLevel;
+
+/** `outlines`: ink outlines on actors; they go last (only battery saver drops them), since they carry fight readability. */
+export interface QualityProfile { label: string; ratio: number; shadow: number; particles: number; outlines: boolean }
+export const QUALITY: Record<QualityLevel, QualityProfile> = {
+  low: { label: 'Battery saver', ratio: .85, shadow: 0, particles: .45, outlines: false },
+  medium: { label: 'Balanced', ratio: 1.25, shadow: 1024, particles: .75, outlines: true },
+  high: { label: 'Sharp', ratio: 2, shadow: 2048, particles: 1, outlines: true },
+};
+/** Keep model detail, outlines and atlas/pixel resolution while relieving mobile rendering cost. */
+const MOBILE_REDUCED: Record<QualityLevel, QualityProfile> = {
+  low: QUALITY.low,
+  medium: { ...QUALITY.medium, shadow: 0, particles: .45 },
+  high: { ...QUALITY.high, shadow: 0, particles: .45 },
+};
+/**
+ * Render resolution (Settings, saved with the adventure: settings.renderRes): the most device pixels drawn per CSS pixel.
+ * Auto caps phones at PHONE_AUTO_RATIO, as the reference does (487×1055 on a 390×844 phone, 2.6× fewer pixels than our
+ * old 2×), and leaves desktops to the Graphics level. It is a ceiling: the Graphics level's own ratio and the automatic
+ * governor (for a slow device) may still go lower; Sharp gives the old behaviour.
+ */
+export type ResolutionSetting = 'auto' | 'sharp' | 'balanced' | 'saver';
+export const RESOLUTION: Record<Exclude<ResolutionSetting, 'auto'>, { label: string; ratio: number }> = {
+  sharp: { label: 'Sharp', ratio: 2 }, balanced: { label: 'Balanced', ratio: 1.25 }, saver: { label: 'Battery saver', ratio: .85 },
+};
+export const PHONE_AUTO_RATIO = 1.25;
+export const RESOLUTION_SETTINGS: readonly ResolutionSetting[] = ['auto', 'sharp', 'balanced', 'saver'];
+export const isResolution = (v: unknown): v is ResolutionSetting => typeof v === 'string' && (RESOLUTION_SETTINGS as readonly string[]).includes(v);
+/** The highest ratio a resolution setting allows on this device (Infinity: no cap beyond the quality level). */
+export const resolutionCap = (setting: ResolutionSetting, mobile: boolean) => setting === 'auto' ? (mobile ? PHONE_AUTO_RATIO : Infinity) : RESOLUTION[setting].ratio;
+export const QUALITY_KEY = 'zoo-garden-graphics';
+/** Old mobile Auto levels were learned before the farm rendering optimizations and Sharp default. */
+export const AUTO_GRAPHICS_VERSION = 2;
+export interface StoredGraphics { setting?: QualitySetting; autoLevel?: QualityLevel | null; autoVersion?: number }
+
+export interface GraphicsEnvironment { mobile: boolean; devicePixelRatio: number }
+export type GraphicsChange = 'ratio' | 'level' | 'effects' | null;
+
+/** Seconds a level must hold before it is remembered, and the frame rate that counts as a good second. */
+const HOLD_SECONDS = 60, GOOD_FPS = 55;
+
+export class GraphicsGovernor {
+  setting: QualitySetting;
+  /** Level the automatic mode uses now (null: the device's default). */
+  autoLevel: QualityLevel | null;
+  ratio: number;
+  fps = 0;
+  private env: GraphicsEnvironment;
+  private frames = 0; private elapsed = 0; private slowSeconds = 0;
+  /** The automatic level remembered for the next visit: only one that held for a minute of play. */
+  private kept: QualityLevel | null;
+  private goodSeconds = 0; private heldSeconds = 0; private upWait = 10; private upTrial = 0; private unsaved = false;
+  private effectsReduced = false;
+
+  constructor(env: GraphicsEnvironment, stored?: StoredGraphics | null, legacyLow = false) {
+    this.env = env;
+    const valid = (v: unknown): v is QualitySetting => v === 'auto' || v === 'low' || v === 'medium' || v === 'high';
+    this.setting = valid(stored?.setting) ? stored!.setting! : legacyLow ? 'low' : 'auto';
+    this.autoLevel = this.kept = stored?.autoLevel && stored.autoLevel in QUALITY ? stored.autoLevel : null;
+    if (env.mobile && this.setting === 'auto' && stored && stored.autoVersion !== AUTO_GRAPHICS_VERSION) {
+      this.autoLevel = this.kept = null; this.unsaved = true;
+    }
+    this.ratio = this.targetRatio();
+  }
+
+  get mobile() { return this.env.mobile; }
+  get level(): QualityLevel {
+    if (this.setting !== 'auto') return this.setting;
+    return this.autoLevel ?? this.defaultLevel;
+  }
+  get profile() { return this.env.mobile && this.setting === 'auto' && this.effectsReduced ? MOBILE_REDUCED[this.level] : QUALITY[this.level]; }
+  /** The Render resolution setting (settings.renderRes); see RESOLUTION. */
+  resolution: ResolutionSetting = 'auto';
+  targetRatio() { return Math.min(this.env.devicePixelRatio, this.profile.ratio, resolutionCap(this.resolution, this.env.mobile)); }
+  /** Applies the Render resolution setting; the ratio moves to its target at once. */
+  setResolution(setting: ResolutionSetting) { this.resolution = isResolution(setting) ? setting : 'auto'; this.ratio = this.targetRatio(); }
+
+  choose(setting: QualitySetting) {
+    this.setting = setting; this.effectsReduced = false; this.frames = this.elapsed = this.slowSeconds = this.goodSeconds = 0;
+    if (setting === 'auto') this.autoLevel = this.kept = null; this.ratio = this.targetRatio();
+  }
+
+  /**
+   * Feed every frame's duration. Once per second in automatic mode: three slow
+   * seconds in a row (under 36 fps) first remove shadows and extra decoration on
+   * mobile, then lower resolution by a quarter step down to 1×,
+   * then the quality level, then resolution again down to 0.7×; a fast second
+   * (over 57 fps) restores resolution toward the level's target, and ten good
+   * seconds in a row (55 fps or more) at full resolution step back up a level.
+   */
+  sample(dt: number, playing: boolean): GraphicsChange {
+    // Even a brief menu/background transition ends the measurement window: paused frames
+    // must not finish an old slow streak on the first frame back in the game.
+    if (!playing) { this.frames = this.elapsed = this.slowSeconds = this.goodSeconds = 0; return null; }
+    if (!Number.isFinite(dt) || dt <= 0) return null;
+    this.frames++; this.elapsed += dt;
+    if (this.elapsed < 1) return null;
+    const fps = this.frames / this.elapsed; this.fps = fps; this.frames = 0; this.elapsed = 0;
+    // Pauses, menus and the settling seconds after start or landing break a streak: only play is judged.
+    if (this.setting !== 'auto') { this.slowSeconds = this.goodSeconds = 0; return null; }
+    // A level is remembered only after a minute of play, so a short spike (a crowded fight, a busy
+    // moment on the device) lowers quality for the moment but never for the next visit.
+    if (this.autoLevel !== this.kept && ++this.heldSeconds >= HOLD_SECONDS) { this.kept = this.autoLevel; this.unsaved = true; }
+    if (this.upTrial > 0) this.upTrial--;
+    if (fps < 36) {
+      this.goodSeconds = 0;
+      if (++this.slowSeconds < 3) return null;
+      this.slowSeconds = 0;
+      if (this.env.mobile && !this.effectsReduced && this.profile.shadow > 0) {
+        if (this.upTrial > 0) this.upWait = Math.min(160, this.upWait * 2);
+        this.effectsReduced = true; return 'effects';
+      }
+      if (this.ratio > 1) { this.ratio = Math.max(1, this.ratio - .25); return 'ratio'; }
+      const lower: Partial<Record<QualityLevel, QualityLevel>> = { high: 'medium', medium: 'low' };
+      const next = lower[this.level];
+      // A step up undone within 20 s doubles the wait before the next one, so a borderline device does not flicker.
+      if (next) { if (this.upTrial > 0) this.upWait = Math.min(160, this.upWait * 2); this.setAuto(next); this.ratio = Math.min(this.ratio, this.targetRatio()); return 'level'; }
+      if (this.ratio > .7) { this.ratio = Math.max(.7, this.ratio - .15); return 'ratio'; }
+      return null;
+    }
+    this.slowSeconds = 0; this.goodSeconds = fps >= GOOD_FPS ? this.goodSeconds + 1 : 0;
+    const target = this.targetRatio();
+    if (fps > 57 && this.ratio < target) { this.ratio = Math.min(target, this.ratio + .25); return 'ratio'; }
+    const higher: Partial<Record<QualityLevel, QualityLevel>> = { low: 'medium', medium: 'high' };
+    const up = higher[this.level];
+    if (up && this.level !== this.defaultLevel && this.goodSeconds >= this.upWait && this.ratio >= target) { this.setAuto(up); this.goodSeconds = 0; this.upTrial = 20; return 'level'; }
+    // Restore expensive decoration only after resolution/level recovered and held steady.
+    if (this.effectsReduced && this.level === this.defaultLevel && this.ratio >= target && this.goodSeconds >= Math.max(20, this.upWait)) {
+      this.effectsReduced = false; this.goodSeconds = 0; this.upTrial = 20; return 'effects';
+    }
+    return null;
+  }
+
+  /** True once after the remembered level changed; the caller then saves the settings. */
+  takeSave() { const save = this.unsaved; this.unsaved = false; return save; }
+
+  toJSON() { return { setting: this.setting, autoLevel: this.kept, autoVersion: AUTO_GRAPHICS_VERSION }; }
+
+  private get defaultLevel(): QualityLevel { return 'high'; }
+  private setAuto(level: QualityLevel) { this.autoLevel = level === this.defaultLevel ? null : level; this.heldSeconds = 0; }
+}
+
+export function detectEnvironment(): GraphicsEnvironment {
+  const coarse = typeof matchMedia === 'function' && matchMedia('(pointer: coarse)').matches;
+  const agent = typeof navigator === 'undefined' ? '' : navigator.userAgent;
+  return { mobile: coarse || /Android|iPhone|iPad|iPod/i.test(agent), devicePixelRatio: typeof devicePixelRatio === 'number' ? devicePixelRatio : 1 };
+}
+
+export function loadGraphics(legacyLow: boolean) {
+  let stored: StoredGraphics | null = null;
+  try { stored = JSON.parse(localStorage.getItem(QUALITY_KEY) ?? 'null'); } catch { /* Defaults apply. */ }
+  return new GraphicsGovernor(detectEnvironment(), stored, legacyLow);
+}
+
+export function saveGraphics(governor: GraphicsGovernor) {
+  try { localStorage.setItem(QUALITY_KEY, JSON.stringify(governor)); } catch { /* Settings stay for this session. */ }
+}

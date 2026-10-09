@@ -1,0 +1,21 @@
+/* Fullscreen and install controls. Inside the HUD menu they render as round
+   buttons (see style.css); this is the fallback dock when no menu slot exists. */
+.platform-tools { position: fixed; right: 20px; bottom: 20px; z-index: 24; display: flex; gap: 7px; }
+.platform-tools button {
+  padding: 7px 12px;
+  border: 3px solid #fff;
+  border-radius: 999px;
+  background: linear-gradient(180deg, #8fe06a, #4cc93a);
+  color: #fff;
+  box-shadow: 0 4px 0 rgba(44, 58, 38, .18);
+  font: 900 13px 'Nunito Variable', sans-serif;
+  cursor: pointer;
+}
+.platform-tools button[hidden] { display: none; }
+#platform-slot .platform-tools { position: static; display: flex; gap: inherit; }
+#platform-slot .platform-tools button:not(:first-child) { font-size: 0; }
+#platform-slot .platform-tools button:not(:first-child)::before { content: '📲'; font-size: 19px; }
+@media (max-width: 620px) {
+  .platform-tools { right: 10px; bottom: calc(135px + env(safe-area-inset-bottom)); gap: 5px; }
+  #platform-slot .platform-tools button:not(:first-child)::before { font-size: 16px; }
+}
