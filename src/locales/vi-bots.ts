@@ -1,0 +1,32 @@
+import { BOT_LINE_PAIRS } from '../bot-lines.ts';
+import { CHAT_VI } from '../bot-chat.ts';
+/** Vietnamese copy for the AI neighbours (bots.ts): the speech lines come from bot-lines.ts, the rest is here. */
+export const VI_BOTS: Record<string, string> = {
+  ...BOT_LINE_PAIRS,
+  ...CHAT_VI,
+  'You left through the gate. Your own garden is waiting when you come back.': 'Bạn đã ra ngoài qua cổng. Khu vườn của bạn đang đợi khi bạn quay về.',
+  'AI neighbours': 'Hàng xóm AI',
+  'Friendly explorers who fight in the wild, make friends and give gifts. Always off while you play online.': 'Những nhà thám hiểm thân thiện chiến đấu ở vùng hoang, kết bạn và tặng quà. Luôn tắt khi bạn chơi online.',
+  'Chat': 'Trò chuyện',
+  'Back': 'Quay lại',
+  'Send': 'Gửi',
+  'Message': 'Tin nhắn',
+  'Type a message…': 'Nhập tin nhắn…',
+  'Neighbours': 'Hàng xóm',
+  'Close': 'Đóng',
+  'Show AI neighbours': 'Hiện hàng xóm AI',
+  'Neighbours fight enemies in the wild beyond the four gates, so go out and meet them there. Some are rich and wear rare outfits. Become friends and they give you gifts, let you visit their gardens, and sometimes walk in through a gate to visit yours.': 'Hàng xóm chiến đấu với kẻ địch ở vùng hoang ngoài bốn cổng, hãy ra ngoài gặp họ. Có người giàu và mặc đồ hiếm. Kết bạn để nhận quà, ghé thăm vườn của họ, và thỉnh thoảng họ sẽ đi qua cổng vào thăm vườn của bạn.',
+  'flies': 'biết bay',
+  'Become friends first.': 'Hãy kết bạn trước.',
+  'Visit garden': 'Thăm vườn',
+  'Costume': 'Hóa trang',
+  'Outfit': 'Trang phục',
+  '{name} would like to be your friend.': '{name} muốn làm bạn với bạn.',
+  'Be friends': 'Kết bạn',
+  'Maybe later': 'Để sau nhé',
+  'A gift from {name}': 'Quà từ {name}',
+  '{n} energy': '{n} năng lượng',
+  '+{n} energy': '+{n} năng lượng',
+  '{name} gave you {n} energy.': '{name} tặng bạn {n} năng lượng.',
+  "Leave {name}'s garden": 'Rời vườn của {name}',
+};
