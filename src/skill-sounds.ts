@@ -1,0 +1,21 @@
+import type { Sound } from './sfx.ts';
+/** Each skill's cast sound, so a blizzard, a thunder chain and a hammer blow no longer share one 'punch'. */
+const SPECIAL: Record<string, Sound> = {
+  fist: 'punch', crescent: 'swing', gore: 'swing', wave: 'swing', tsunami: 'splash', peastorm: 'shoot', bigbubble: 'pop', nova: 'shoot',
+  blizzard: 'freeze', magma: 'boom', thunder: 'zap', bonk: 'boom', whirl: 'swing', starfall: 'magic', inferno: 'boom', laser: 'zap',
+  // The uniform specials (uniform-skills.ts) sound like the same skill in the uniform's disguise kit: a cork pop, an anchor swing, ...
+  volley: 'pop', anchor: 'swing', lotus: 'magic', dragon: 'swing', eagle: 'swing', goldstar: 'magic',
+};
+const DISGUISE: Record<string, readonly Sound[]> = {
+  dz_superhero: ['magic', 'boom', 'zap', 'boom'], dz_ninja: ['poof', 'poof', 'swing', 'poof'], dz_mage: ['cast', 'magic', 'magic', 'magic'],
+  dz_knight: ['hit', 'swing', 'alert', 'magic'], dz_mecha: ['shock', 'zap', 'zap', 'magic'], dz_dino: ['crit', 'swing', 'alert', 'boom'],
+  dz_fairy: ['magic', 'magic', 'magic', 'harvest'], dz_pirate: ['boom', 'snap', 'alert', 'boom'], dz_vampire: ['magic', 'poof', 'poof', 'magic'],
+  dz_snowman: ['freeze', 'poof', 'freeze', 'freeze'],
+  // The uniforms: a cork pop, a sandbag thud, a flare whoosh, crates landing; anchor, splash, whistle, lighthouse chime; ...
+  dz_army: ['pop', 'hit', 'shoot', 'boom'], dz_navy: ['swing', 'splash', 'alert', 'level'], dz_aodai: ['magic', 'swing', 'swing', 'success'],
+  dz_aodai_man: ['swing', 'cast', 'poof', 'level'], dz_usa: ['swing', 'hit', 'magic', 'boom'], dz_vietnam: ['magic', 'swing', 'boom', 'crit'],
+};
+export function skillSound(index: number, disguise?: string, special = 'fist'): Sound {
+  if (disguise) return DISGUISE[disguise]?.[index] ?? 'punch';
+  return index === 0 ? 'swing' : index === 1 ? 'swing' : index === 2 ? 'boom' : SPECIAL[special] ?? 'crit';
+}
