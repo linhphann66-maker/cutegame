@@ -1,0 +1,61 @@
+import * as T from 'three';
+import {ELECTRIC_SHOTS,type CombatAlly,type CombatEffect,type Projectile} from './combat.ts';
+import {makeSummon,animateSummon,summonHealth} from './summon-art.ts';
+import {createHarpoonProjectile} from './harpoon-art.ts';
+import {makeShot,poseShot,lookOf} from './shot-art.ts';
+export class CombatView {
+  private scene:T.Scene;private shots=new Map<number,T.Object3D>();private spareShots=new Map<string,T.Group[]>();private clock=0;private effects:Array<{mesh:T.Mesh;life:number;max:number;kind:string}>=[];
+  private allies=new Map<number,T.Group>();private spareAllies=new Map<string,T.Group[]>();
+  /** Called every frame for each flying electric shot (skill-fx.ts crackles around it). */
+  electric?:(x:number,y:number,z:number,dx:number,dz:number)=>void;
+  /** A faint mote left behind a flying shot now and then (the world's pooled glow particles draw it). */
+  trail?:(x:number,y:number,z:number,color:string)=>void;
+  constructor(scene:T.Scene){this.scene=scene;}
+  /** Effect geometry by shape and size, and finished effect meshes for reuse: no material or geometry is made or freed per swing (each new material relinked a shader). */
+  private shapes=new Map<string,T.BufferGeometry>();private spare:T.Mesh[]=[];
+  private shape(e:CombatEffect){const key=e.kind+':'+e.radius.toFixed(2)+':'+(e.width??.65).toFixed(2);let geometry=this.shapes.get(key);
+    if(!geometry){if(e.kind==='beam')geometry=new T.PlaneGeometry(e.width??.65,e.radius);else if(e.kind==='arc')geometry=new T.RingGeometry(e.radius*.78,e.radius,28,1,-Math.PI*.65,Math.PI*1.3);else if(e.kind==='cast')geometry=new T.RingGeometry(e.radius*.92,e.radius,40);else geometry=new T.RingGeometry(e.radius*.65,e.radius,32);this.shapes.set(key,geometry);}
+    return geometry;}
+  effect(e:CombatEffect){
+    const mesh=this.spare.pop()??new T.Mesh(undefined,new T.MeshBasicMaterial({transparent:true,opacity:.72,side:T.DoubleSide,depthWrite:false}));
+    mesh.geometry=this.shape(e);(mesh.material as T.MeshBasicMaterial).color.set(e.color);(mesh.material as T.MeshBasicMaterial).opacity=.72;
+    mesh.rotation.set(-Math.PI/2,0,0);mesh.scale.setScalar(1);mesh.position.set(e.x,e.kind==='cast'?.15:.6,e.z);
+    // The plane's long side lies along (sin f, cos f) only with +f (−f mirrored every diagonal beam across the z axis).
+    if(e.kind==='beam'){mesh.rotation.z=e.facing??0;mesh.position.x+=Math.sin(e.facing??0)*e.radius/2;mesh.position.z+=Math.cos(e.facing??0)*e.radius/2;}
+    if(e.kind==='arc')mesh.rotation.z=-(e.facing??0)+Math.PI/2;
+    this.scene.add(mesh);const life=e.duration??(e.kind==='cast'?.7:e.kind==='trail'?.24:.38);this.effects.push({mesh,life,max:life,kind:e.kind});
+  }
+  /**
+   * Builds `count` summons of `kind` ahead of time into the spare pool and lets `compile` warm their shaders, so the
+   * first cast shows them on its first frame (the ninja's shadow clones stalled ~60 ms on their first cast).
+   */
+  prewarm(kind:CombatAlly['kind'],count:number,compile?:(group:T.Group)=>void){
+    const list=this.spareAllies.get(kind)??[];while(list.length<count){const model=makeSummon(kind);model.userData.allyKind=kind;list.push(model);}this.spareAllies.set(kind,list);
+    if(compile){const group=new T.Group();for(const model of list)group.add(model);compile(group);for(const model of list)group.remove(model);}
+  }
+  /** More summons to draw besides ours (main.ts: other explorers' hittable summons online). */
+  extraAllies?:()=>CombatAlly[];
+  update(dt:number,projectiles:Projectile[],active=true,own:CombatAlly[]=[]){
+    const extra=this.extraAllies?.(),allies=extra?.length?[...own,...extra]:own;
+    const allyIds=new Set(allies.map(ally=>ally.id));for(const[id,model]of this.allies)if(!allyIds.has(id)){this.disposeAlly(model);this.allies.delete(id);}
+    for(const ally of allies){let model=this.allies.get(ally.id);if(!model){model=this.spareAllies.get(ally.kind)?.pop()??makeSummon(ally.kind);model.userData.allyKind=ally.kind;this.allies.set(ally.id,model);this.scene.add(model);}model.position.set(ally.x,ally.kind==='bat'?.7:ally.kind==='parrot'?1.7:0,ally.z);model.rotation.y=ally.facing??0;animateSummon(model,ally.kind,this.clock);if(ally.maxHp)summonHealth(model,ally.kind,(ally.hp??0)/ally.maxHp,ally.hurt??0);}
+    const ids=new Set(projectiles.map(p=>p.id));for(const[id,mesh]of this.shots)if(!ids.has(id)){this.release(mesh);this.shots.delete(id);}
+    if(active)this.clock+=dt;
+    for(const p of projectiles){let mesh=this.shots.get(p.id);
+      if(!mesh){
+        if(p.kind==='harpoon')mesh=createHarpoonProjectile();
+        else if(ELECTRIC_SHOTS.has(p.kind))mesh=new T.Mesh(new T.IcosahedronGeometry(.13,1),new T.MeshBasicMaterial({color:'#f2fdff'}));
+        else{const key=p.kind+':'+(p.initialRadius??p.radius).toFixed(2)+':'+p.color;mesh=this.spareShots.get(key)?.pop()??makeShot(p.kind,p.initialRadius??p.radius,p.color);mesh.userData.key=key;mesh.userData.trailT=0;}
+        this.shots.set(p.id,mesh);this.scene.add(mesh);}
+      if(mesh.userData.look){poseShot(mesh as T.Group,p.x,p.kind==='wave'?.55:p.kind==='snowball'?p.radius:1.05,p.z,p.direction.x,p.direction.z,this.clock);if(p.kind==='snowball'){mesh.scale.setScalar(p.radius/(p.initialRadius??p.radius));mesh.rotation.set(this.clock*p.direction.z*7,0,-this.clock*p.direction.x*7);}
+        if(active&&this.trail&&lookOf(p.kind)!=='rock'&&(mesh.userData.trailT-=dt)<=0){mesh.userData.trailT=.07;this.trail(p.x,1.05,p.z,p.color);}}
+      else{mesh.position.set(p.x,1.05,p.z);if(p.kind==='harpoon')mesh.rotation.y=Math.atan2(p.direction.x,p.direction.z);if(active&&ELECTRIC_SHOTS.has(p.kind))this.electric?.(p.x,1.05,p.z,p.direction.x,p.direction.z);}}
+    if(!active)return;
+    for(let i=this.effects.length-1;i>=0;i--){const e=this.effects[i];e.life-=dt;(e.mesh.material as T.MeshBasicMaterial).opacity=.72*Math.max(0,e.life/e.max);if(e.kind!=='beam'&&e.kind!=='cast'){const scale=1+(1-e.life/e.max)*.65;e.mesh.scale.setScalar(scale);}if(e.life<=0){this.scene.remove(e.mesh);this.spare.push(e.mesh);this.effects.splice(i,1);}}
+  }
+  clear(){for(const mesh of this.shots.values())this.release(mesh);this.shots.clear();for(const effect of this.effects){this.scene.remove(effect.mesh);this.spare.push(effect.mesh);}this.effects=[];for(const model of this.allies.values())this.disposeAlly(model);this.allies.clear();}
+  private disposeAlly(group:T.Group){this.scene.remove(group);const kind=group.userData.allyKind as string,list=this.spareAllies.get(kind)??[];if(list.length<12)list.push(group);this.spareAllies.set(kind,list);}
+  /** Pooled shots (shared geometry and materials) go back to their pool; the harpoon and electric bolts own theirs. */
+  private release(obj:T.Object3D){if(obj.userData.look){this.scene.remove(obj);const key=obj.userData.key as string,list=this.spareShots.get(key)??[];if(list.length<24)list.push(obj as T.Group);this.spareShots.set(key,list);}else this.dispose(obj as T.Mesh);}
+  private dispose(mesh:T.Mesh){this.scene.remove(mesh);mesh.geometry.dispose();(mesh.material as T.Material).dispose();}
+}

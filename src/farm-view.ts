@@ -1,0 +1,603 @@
+import * as T from 'three';
+import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
+import { bakeModel, farmKit } from './assets.ts';
+import { toonMaterial } from './toon.ts';
+import { detectEnvironment } from './graphics.ts';
+import { ANIMALS, ANIMAL_KINDS, PEN, YARD, MAX_ANIMALS_PER_KIND, expired, isAdult, productReady, growth, coatOf, type FarmState, type Animal, type AnimalKind } from './farm.ts';
+import { DOG_LEASH, leashSpot } from './guard-dog.ts';
+import { newRoamer, spawnSpot, stepRoamer, segmentClear, RoamGrid, type RoamArea, type Roamer } from './farm-roam.ts';
+
+/**
+ * The animal pen at home, drawn cheaply: the fence, gate, coop, troughs, hay and floor are baked into a few merged
+ * meshes, and the animals are rigid named parts (farm.glb, CONTRACT.md "Farm pen": <id>_body, _head, _wing_l/_r,
+ * _leg_l/_r or _leg_fl/fr/bl/br, _tail, each with its origin at its hinge) drawn as one InstancedMesh per kind and part,
+ * so eight chickens cost the same draws as one. Until farm.glb loads (or if it is missing) simple shapes with the same
+ * part names stand in. Animals roam the whole home village (farm-roam.ts: clear straight walks, long rests, grazing,
+ * dust baths, back to the yard after a long trip) and scurry off when the explorer comes close. Until the pen is built
+ * the statics are only a marked plot with a sign. A ready egg or milk bottle bobs over the animal that made it; a collected product flies up and shrinks like a harvested crop.
+ */
+export { farmKit };
+
+type ModelId = 'chicken' | 'chick' | 'duck' | 'duckling' | 'cow' | 'calf' | 'pig' | 'piglet' | 'goat' | 'kid' | 'goose' | 'gosling' | 'dog';
+type ProductId = 'egg' | 'milk' | 'meat' | 'duck_egg' | 'truffle';
+type Role = 'body' | 'head' | 'wing_l' | 'wing_r' | 'leg_l' | 'leg_r' | 'leg_fl' | 'leg_fr' | 'leg_bl' | 'leg_br' | 'tail';
+const ROLES: readonly Role[] = ['body', 'head', 'wing_l', 'wing_r', 'leg_l', 'leg_r', 'leg_fl', 'leg_fr', 'leg_bl', 'leg_br', 'tail'];
+const PART_NAME = /_(body|head|wing_[lr]|leg_[lr]|leg_[fb][lr]|tail)(?:_\d+)?$/;
+const modelOf = (a: Animal, now: number): ModelId => isAdult(a, now) ? a.kind : a.kind === 'chicken' ? 'chick' : a.kind === 'cow' ? 'calf' : a.kind === 'duck' ? 'duckling' : a.kind === 'pig' ? 'piglet' : a.kind === 'goat' ? 'kid' : a.kind === 'goose' ? 'gosling' : 'dog';
+/** Product per model; chicks and calves make nothing. */
+const PRODUCT: Record<AnimalKind, ProductId> = { chicken: 'egg', cow: 'milk', duck: 'duck_egg', pig: 'truffle', goat: 'milk', goose: 'duck_egg', dog: 'meat' };
+/** Most animals of one model the pen can hold (cap at the largest pen); a model has up to four legs. */
+const MAX_PER_MODEL: Record<ModelId, number> = { chicken: MAX_ANIMALS_PER_KIND, chick: MAX_ANIMALS_PER_KIND, cow: MAX_ANIMALS_PER_KIND, calf: MAX_ANIMALS_PER_KIND, duck: MAX_ANIMALS_PER_KIND, duckling: MAX_ANIMALS_PER_KIND, pig: MAX_ANIMALS_PER_KIND, piglet: MAX_ANIMALS_PER_KIND, goat: MAX_ANIMALS_PER_KIND, kid: MAX_ANIMALS_PER_KIND, goose: MAX_ANIMALS_PER_KIND, gosling: MAX_ANIMALS_PER_KIND, dog: 1 };
+/** Four-legged walkers and how far each leg swings (radians) at full walking speed: short, natural paces. */
+const QUADRUPED = new Set<AnimalKind>(['cow', 'pig', 'goat', 'dog']);
+const LEG_SWING: Partial<Record<AnimalKind, number>> = { cow: .3, pig: .32, goat: .34, dog: .38 };
+const MAX_LEGS = 4, MAX_PRODUCTS = MAX_ANIMALS_PER_KIND * 24;
+/** Hens and chicks are drawn 1.3x their true size so they read at the game camera (a hen is then about 40 px tall, like a ripe crop); the puppy 1.35x (about knee-high to the explorer). */
+export const SHOWN: Record<AnimalKind, number> = { chicken: 1.3, cow: 1, duck: 1.3, pig: 1, goat: 1, goose: 1.15, dog: 1.35 };
+
+/** Pen pieces inside the fence (pen-local metres, +z toward the gate and the garden), also the animals' keep-out circles. */
+export const PEN_PROPS: readonly { id: string; x: number; z: number; rot: number; r: number }[] = [
+  { id: 'coop', x: -2.05, z: -1.05, rot: .35, r: 1.05 },
+  { id: 'feed_trough', x: .15, z: -1.55, rot: 0, r: .55 },
+  { id: 'water_trough', x: 2.15, z: -1.25, rot: 0, r: .65 },
+  { id: 'hay_bale', x: 2.45, z: .65, rot: Math.PI / 2, r: .55 },
+];
+
+/**
+ * Breed coats (farm.ts BREEDS order): [coat, second colour, fleck share]. The second colour paints a cow's patches
+ * (or a calf's spots) and a hen's flecks: speckles, a black hen's green sheen, a brown chick's stripes. They are
+ * per-instance colours on the shared part meshes (a vertex mask picks coat, patch or keep), so a herd of five breeds
+ * costs exactly the draws of one.
+ */
+export const COATS: Record<ModelId, readonly (readonly [string, string, number])[]> = {
+  chicken: [['#fffcf2', '#fffcf2', 0], ['#b8592b', '#7e3418', .18], ['#2a2a30', '#2f6b4f', .3], ['#ece6da', '#4a4646', .34], ['#efb85f', '#d4913a', .12]],
+  chick: [['#ffe27a', '#ffe27a', 0], ['#d4a265', '#7a4a26', .28], ['#4a4a50', '#f2e3a0', .16], ['#dcd3b0', '#857b6b', .3], ['#ffcf4a', '#f2b23a', .1]],
+  cow: [['#fffaf0', '#3b3440', 0], ['#b97a42', '#8a5630', 0], ['#fffaf0', '#a03a24', 0], ['#2f2b32', '#222026', 0], ['#cc6a2a', '#b0561e', 0]],
+  calf: [['#fffaf0', '#3b3440', 0], ['#c58a52', '#9a6438', 0], ['#fffaf0', '#a03a24', 0], ['#38343b', '#28252c', 0], ['#d4763a', '#bc6228', 0]],
+  duck: [['#fffaf0', '#d6e4d5', 0], ['#356d50', '#a87a49', .2], ['#b39168', '#72583c', .1]],
+  duckling: [['#ffde63', '#edbf35', 0], ['#b8a146', '#765c37', .2], ['#ccaa6b', '#72583c', .1]],
+  pig: [['#ffb4c0', '#e58f9d', 0], ['#ffb4c0', '#694d4a', .25], ['#ba794d', '#845035', .1]],
+  piglet: [['#ffc1cd', '#eaa0ae', 0], ['#ffc1cd', '#694d4a', .25], ['#cb8c61', '#845035', .1]],
+  goat: [['#fbf0dc', '#a56a3a', 0], ['#e9dcc4', '#4a3a30', 0], ['#7a5a40', '#2f2520', 0]],
+  kid: [['#fbf0dc', '#a56a3a', 0], ['#e9dcc4', '#4a3a30', 0], ['#8a6a4e', '#2f2520', 0]],
+  goose: [['#fffbf2', '#fffbf2', 0], ['#b9b2a6', '#8a8276', 0], ['#a88660', '#7a5e3e', 0]],
+  gosling: [['#ffe27a', '#ffe27a', 0], ['#c9c0a0', '#a89f80', 0], ['#c8a574', '#a8845a', 0]],
+  // The puppy's second colour paints its muzzle, chest, ruff, paws and tail tip (no flecks: a clean, friendly coat).
+  dog: [['#eba55e', '#fff3dc', 0], ['#4a3f48', '#f0b878', 0], ['#fff9ee', '#f4cf9e', 0]],
+};
+const COAT_COLORS = Object.fromEntries(Object.entries(COATS).map(([id, list]) => [id, list.map(([a, b, f]) => [new T.Color(a), new T.Color(b), f] as const)])) as unknown as Record<ModelId, readonly (readonly [T.Color, T.Color, number])[]>;
+/** The two instanced coat attributes, as one constant list (no array literal per frame). */
+const COAT_ATTRS = ['coatA', 'coatB'] as const;
+/**
+ * Which materials are coat (1) or patch (2), by farm.glb material name or a stand-in's colour, with the colour the
+ * mask's shading is measured against (a chick's darker wing stays a shade darker in every breed).
+ */
+const COAT_PARTS: Record<ModelId, Record<string, [1 | 2, string]>> = {
+  chicken: { 'Farm feather': [1, '#fffcf2'], '#fffaf0': [1, '#fffaf0'], '#f3e5d0': [1, '#fffaf0'] },
+  chick: { 'Farm chick': [1, '#ffd640'], 'Farm chick wing': [1, '#ffd640'], '#ffd84a': [1, '#ffd84a'] },
+  cow: { 'Farm cow': [1, '#fffaf0'], 'Farm cow patch': [2, '#3b3440'], '#ffffff': [1, '#ffffff'], '#2f2a2e': [2, '#2f2a2e'] },
+  calf: { 'Farm calf': [1, '#e89a52'], 'Farm cow': [2, '#fffaf0'], '#e8b07a': [1, '#e8b07a'], '#fff3e0': [2, '#fff3e0'] },
+  duck: { 'Farm duck': [1, '#fffaf0'], '#fffaf0': [1, '#fffaf0'] },
+  duckling: { 'Farm duckling': [1, '#ffde63'], '#ffde63': [1, '#ffde63'] },
+  pig: { 'Farm pig': [1, '#ffb4c0'], '#ffb4c0': [1, '#ffb4c0'] },
+  piglet: { 'Farm piglet': [1, '#ffc1cd'], '#ffc1cd': [1, '#ffc1cd'] },
+  goat: { 'Farm goat': [1, '#fbf0dc'], 'Farm goat patch': [2, '#a56a3a'] },
+  kid: { 'Farm goat': [1, '#fbf0dc'], 'Farm goat patch': [2, '#a56a3a'] },
+  goose: { 'Farm goose': [1, '#fffbf2'] },
+  gosling: { 'Farm gosling': [1, '#ffe27a'] },
+  dog: { 'Farm dog': [1, '#e8a25a'], 'Farm dog ear': [1, '#e8a25a'], 'Farm dog light': [2, '#fff1d8'], '#e8a25a': [1, '#e8a25a'], '#fff1d8': [2, '#fff1d8'] },
+};
+
+/** A drawn piece: one geometry hung at one hinge (legs: at each leg's hinge, swinging by `sign`). */
+interface Part {
+  draw: 'body' | 'head' | 'tail' | 'legs'; geometry: T.BufferGeometry; pivots: { at: T.Vector3; sign: number }[];
+  /** Its instanced mesh and breed-colour attributes, found once (no per-frame key lookups). */
+  mesh?: T.InstancedMesh; coatA?: T.InstancedBufferAttribute; coatB?: T.InstancedBufferAttribute;
+}
+interface Rig { parts: Part[]; height: number }
+/** A roaming animal (world metres, farm-roam.ts) plus how it is drawn. */
+interface Walker extends Roamer { expired: boolean; ready: boolean; model: ModelId; phase: number; pop: number; size: number; seed: number; coat: number; lodT: number; lodDt: number; seen: boolean }
+/** The low fence behind the yard: 2 m segments centred at these pen-local x, along BACK_FENCE_Z (outside the oval). */
+export const BACK_FENCE = [-2, 0, 2] as const, BACK_FENCE_Z = -(YARD.rz + .35);
+/** A keep-out circle in pen-local metres (beds, decorations, anything else standing in the yard). */
+export interface KeepOut { x: number; z: number; r: number }
+/** Pulls a pen-local point back inside the yard oval shrunk by `margin`. */
+export function intoYard(x: number, z: number, margin: number) {
+  const k = (x / (YARD.rx - margin)) ** 2 + (z / (YARD.rz - margin)) ** 2;
+  return k <= 1 ? { x, z } : { x: x / Math.sqrt(k), z: z / Math.sqrt(k) };
+}
+
+let sharedMaterial: T.MeshToonMaterial | null = null;
+/**
+ * One toon material with vertex colours for every animal part (colours are baked into the merged part geometry). The
+ * coat mask (vertex attribute coatMask: 0 keep, 1 coat, 2 patch) multiplies in each instance's breed colours: coatA
+ * (rgb + fleck share) and coatB. Flecks hash the part-local position, so they stay put as the animal moves.
+ */
+function animalMaterial() {
+  if (sharedMaterial) return sharedMaterial;
+  const m = sharedMaterial = toonMaterial({ vertexColors: true }); m.userData.sharedKit = true;
+  m.onBeforeCompile = shader => {
+    shader.vertexShader = shader.vertexShader
+      .replace('#include <common>', '#include <common>\nattribute float coatMask;\nattribute vec4 coatA;\nattribute vec3 coatB;')
+      .replace('#include <color_vertex>', `#include <color_vertex>
+#ifdef USE_COLOR
+  if (coatMask > .5) {
+    float fleck = fract(sin(dot(floor(position * 24.0), vec3(12.9898, 78.233, 37.719))) * 43758.5453);
+    vColor.rgb *= (coatMask > 1.5 || fleck < coatA.w) ? coatB : coatA.rgb;
+  }
+#endif`);
+  };
+  m.customProgramCacheKey = () => 'farm-coat';
+  return m;
+}
+
+function box(color: string, w: number, h: number, d: number, x = 0, y = 0, z = 0) { const m = new T.Mesh(new T.BoxGeometry(w, h, d), new T.MeshStandardMaterial({ color })); m.position.set(x, y, z); return m; }
+function ball(color: string, r: number, x = 0, y = 0, z = 0, sx = 1, sy = 1, sz = 1) { const m = new T.Mesh(new T.IcosahedronGeometry(r, 1), new T.MeshStandardMaterial({ color })); m.position.set(x, y, z); m.scale.set(sx, sy, sz); return m; }
+function cyl(color: string, r: number, h: number, x = 0, y = 0, z = 0) { const m = new T.Mesh(new T.CylinderGeometry(r, r, h, 8), new T.MeshStandardMaterial({ color })); m.position.set(x, y, z); return m; }
+/** A named part whose origin is its hinge, holding shapes placed relative to that hinge. */
+function part(name: string, pivot: [number, number, number], ...meshes: T.Object3D[]) { const g = new T.Group(); g.name = name; g.position.set(...pivot); g.add(...meshes); return g; }
+
+/** The guard dog's rig (farm.glb's puppy, or the stand-in), merged per part like the pen's animals; the caller owns it. */
+export function dogRig(): Rig { const src = model('dog', true), rig = rigOf(src, COAT_PARTS.dog); src.traverse(o => { if (o instanceof T.Mesh) { if (!o.geometry.userData.sharedKit) o.geometry.dispose(); const m = o.material as T.Material; if (!m.userData.sharedKit) m.dispose(); } }); return rig; }
+/** A breed's linear coat colours for the dog ([coat, second, fleck]). */
+export const dogCoat = (coat: number) => COAT_COLORS.dog[coat] ?? COAT_COLORS.dog[0];
+export { animalMaterial, type Rig, type Part };
+/** Stand-in animals with the contract's part names and hinges, scaled to the contract's heights. */
+export function placeholderAnimal(id: ModelId): T.Group {
+  const g = new T.Group(); g.name = id;
+  if (id === 'chicken' || id === 'chick' || id === 'duck' || id === 'duckling') {
+    const s = id === 'chick' || id === 'duckling' ? .52 : 1, body = id === 'duckling' ? '#ffde63' : id === 'chick' ? '#ffd84a' : '#fffaf0', beak = '#ffaa2b';
+    g.add(part(`${id}_body`, [0, .2 * s, 0], ball(body, .17 * s, 0, .06 * s, 0, 1, .9, 1.2)));
+    g.add(part(`${id}_head`, [0, .34 * s, .1 * s], ball(body, .11 * s, 0, .08 * s, .03 * s), ball(beak, .035 * s, 0, .07 * s, .14 * s, id.startsWith('duck') ? 1.8 : 1, .7, id.startsWith('duck') ? 2.3 : 1.3), ...(id === 'chicken' ? [ball('#ff4a4a', .045 * s, 0, .19 * s, .02 * s, .7, 1, 1.2)] : []), ball('#2a1d1d', .02 * s, .06 * s, .1 * s, .1 * s), ball('#2a1d1d', .02 * s, -.06 * s, .1 * s, .1 * s)));
+    for (const side of [1, -1]) g.add(part(`${id}_wing_${side > 0 ? 'l' : 'r'}`, [side * .15 * s, .3 * s, 0], ball(body, .1 * s, side * .03 * s, -.06 * s, -.02 * s, .45, .8, 1.2)));
+    for (const side of [1, -1]) g.add(part(`${id}_leg_${side > 0 ? 'l' : 'r'}`, [side * .06 * s, .12 * s, 0], cyl(beak, .018 * s, .12 * s, 0, -.06 * s, 0), box(beak, .07 * s, .02 * s, .08 * s, 0, -.115 * s, .02 * s)));
+    g.add(part(`${id}_tail`, [0, .3 * s, -.16 * s], ball(id === 'chick' ? body : '#f3e5d0', .08 * s, 0, .05 * s, -.04 * s, .5, 1.2, .8)));
+  } else if (id === 'dog') {
+    // A stand-in puppy (farm.glb has the real one): a big round head, pale muzzle and paws, upright ears, curled tail.
+    g.add(part('dog_body', [0, .28, .03], ball('#e8a25a', .19, 0, 0, 0, 1, .9, 1.3), ball('#fff1d8', .12, 0, -.02, .14), box('#3fa9f5', .26, .05, .07, 0, .13, .18)));
+    g.add(part('dog_head', [0, .4, .2], ball('#e8a25a', .2, 0, .14, .1), ball('#fff1d8', .09, 0, .08, .26, 1.2, .9, .9), ball('#1c1b2e', .03, 0, .12, .34), ball('#1c1b2e', .035, -.08, .2, .26), ball('#1c1b2e', .035, .08, .2, .26), ball('#b8743a', .07, -.12, .33, .08, .8, 1.5, .5), ball('#b8743a', .07, .12, .33, .08, .8, 1.5, .5)));
+    for (const [n,x,z] of [['fl',-.1,.15],['fr',.1,.15],['bl',-.1,-.17],['br',.1,-.17]] as const) g.add(part(`dog_leg_${n}`, [x,.18,z], cyl('#e8a25a',.05,.14,0,-.09,0), ball('#fff1d8',.06,0,-.15,.01,1,.7,1.2)));
+    g.add(part('dog_tail', [0,.35,-.23], ball('#e8a25a',.06,0,.08,-.04,.9,1.8,.9), ball('#fff1d8',.05,0,.2,-.02)));
+  } else if (id === 'pig' || id === 'piglet') {
+    const dog = false, s = id === 'piglet' ? .58 : 1, coat = dog ? '#c98d4c' : id === 'piglet' ? '#ffc1cd' : '#ffb4c0';
+    g.add(part(`${id}_body`, [0, .48*s, 0], ball(coat, .34*s, 0, 0, 0, 1, .85, 1.45)));
+    g.add(part(`${id}_head`, [0, .58*s, .36*s], ball(coat, .23*s, 0, .03*s, .10*s), ball(dog ? '#fff0d3' : '#ee8ca3', .12*s, 0, -.03*s, .29*s, 1.05, .75, .8), ball('#2a2028', .028*s, -.11*s, .12*s, .26*s), ball('#2a2028', .028*s, .11*s, .12*s, .26*s), ball(coat, .1*s, -.17*s, .22*s, .04*s, .55, 1.3, .5), ball(coat, .1*s, .17*s, .22*s, .04*s, .55, 1.3, .5)));
+    for (const [n,x,z] of [['fl',-.22,.3],['fr',.22,.3],['bl',-.22,-.3],['br',.22,-.3]] as const) g.add(part(`${id}_leg_${n}`, [x*s,.28*s,z*s], cyl(coat,.065*s,.28*s,0,-.14*s,0)));
+    g.add(part(`${id}_tail`, [0,.56*s,-.43*s], ball(coat,.065*s,0,.04*s,-.04*s,.8,dog?2.8:1.1,1)));
+  } else {
+    const s = id === 'calf' ? .66 : 1, coat = id === 'calf' ? '#e8b07a' : '#ffffff', spot = id === 'calf' ? '#fff3e0' : '#2f2a2e';
+    g.add(part(`${id}_body`, [0, .95 * s, 0], box(coat, .9 * s, .62 * s, 1.5 * s, 0, 0, 0), box(spot, .92 * s, .3 * s, .4 * s, 0, .12 * s, -.25 * s), box('#ffc2cf', .3 * s, .14 * s, .3 * s, 0, -.36 * s, -.35 * s)));
+    g.add(part(`${id}_head`, [0, 1.2 * s, .72 * s], box(coat, .5 * s, .5 * s, .45 * s, 0, .1 * s, .22 * s), box('#ffc2cf', .44 * s, .2 * s, .14 * s, 0, -.04 * s, .48 * s), box('#f5d36b', .08 * s, .14 * s, .08 * s, .18 * s, .4 * s, .2 * s), box('#f5d36b', .08 * s, .14 * s, .08 * s, -.18 * s, .4 * s, .2 * s), box('#2a1d1d', .06 * s, .07 * s, .02 * s, .13 * s, .16 * s, .45 * s), box('#2a1d1d', .06 * s, .07 * s, .02 * s, -.13 * s, .16 * s, .45 * s)));
+    for (const [n, x, z] of [['fl', -.3, .55], ['fr', .3, .55], ['bl', -.3, -.55], ['br', .3, -.55]] as const)
+      g.add(part(`${id}_leg_${n}`, [x * s, .68 * s, z * s], box(coat, .18 * s, .62 * s, .18 * s, 0, -.31 * s, 0), box('#5a3d33', .2 * s, .1 * s, .2 * s, 0, -.63 * s, 0)));
+    g.add(part(`${id}_tail`, [0, 1.15 * s, -.76 * s], box(coat, .06 * s, .55 * s, .06 * s, 0, -.27 * s, 0), box('#2f2a2e', .1 * s, .12 * s, .1 * s, 0, -.55 * s, 0)));
+  }
+  return g;
+}
+/** Stand-in pen props and products (simple shapes at the contract's sizes; origin at the ground centre). */
+export function placeholderProp(id: string): T.Group {
+  const g = new T.Group(); g.name = id;
+  if (id === 'pen_fence') for (const x of [-1, 1]) g.add(box('#8a5a3b', .13, .9, .13, x, .45, 0)); else if (id === 'pen_gate') { for (const x of [-1, 1]) g.add(box('#8a5a3b', .15, 1.5, .15, x, .75, 0)); g.add(box('#c98f5a', 2.16, .13, .12, 0, 1.36, 0), box('#e8453c', 1.7, .7, .06, 0, .5, 0)); }
+  if (id === 'pen_fence') for (const y of [.42, .74]) g.add(box('#d99b5c', 2, .13, .055, 0, y, 0));
+  if (id === 'coop') g.add(box('#d8443a', 1.3, .74, 1, 0, .67, 0), box('#f2bf45', 1.6, .2, 1.3, 0, 1.15, 0), box('#f2bf45', 1.1, .25, 1.1, 0, 1.38, 0), box('#5a2c25', .34, .42, .04, 0, .55, .51));
+  if (id === 'feed_trough') g.add(box('#a8714a', 1.2, .3, .5, 0, .25, 0), box('#f0cf5a', 1.08, .06, .38, 0, .4, 0));
+  if (id === 'water_trough') g.add(cyl('#a8714a', .55, .4, 0, .2, 0), cyl('#5cc8ff', .48, .05, 0, .4, 0));
+  if (id === 'hay_bale') g.add(box('#f2cf5b', 1, .5, .6, 0, .26, 0), box('#d84a3c', .04, .52, .62, -.25, .26, 0), box('#d84a3c', .04, .52, .62, .25, .26, 0));
+  if (id === 'meat') g.add(ball('#de8c92', .19, 0, .19, 0, 1.35, .7, 1), cyl('#fff0d6', .065, .13, .2, .19, 0), ball('#fff0d6', .065, .27, .19, .025), ball('#fff0d6', .065, .27, .19, -.025));
+  if (id === 'egg' || id === 'duck_egg') g.add(ball('#fff0d6', .045, 0, .06, 0, 1, 1.3, 1));
+  if (id === 'milk') g.add(cyl('#ffffff', .07, .22, 0, .11, 0), cyl('#2f9bef', .045, .05, 0, .25, 0), cyl('#ef3b3b', .072, .05, 0, .12, 0));
+  if (id.endsWith('_shelter')) { g.add(box('#c78a47',.72,.08,.64,0,.04,0),box('#edc85e',.59,.04,.52,0,.10,0)); if(id==='dog_shelter')g.add(box('#bc6242',.72,.44,.08,0,.22,-.3),box('#d9473b',.82,.12,.75,0,.48,0)); }
+  if (id === 'truffle') g.add(ball('#73503e', .12, 0, .12, 0, 1.2, .9, 1), ball('#a88655', .04, .07, .18, .07));
+  return g;
+}
+function model(id: string, animal: boolean) { return (farmKit.ready ? farmKit.instance(id) : null) ?? (animal ? placeholderAnimal(id as ModelId) : placeholderProp(id)); }
+
+/**
+ * Splits a model into what moves: the head, the tail (cows; a bird's tail and wings ride on its body) and the legs,
+ * which share one geometry hung at each leg's hinge; everything else is the body. Each piece's meshes are merged with
+ * their colours baked in, around its hinge, so a whole model costs three or four draws however many animals use it.
+ */
+export function rigOf(root: T.Object3D, coats: Record<string, [1 | 2, string]> = {}): Rig {
+  root.position.set(0, 0, 0); root.rotation.set(0, 0, 0); root.scale.setScalar(1); root.updateMatrixWorld(true);
+  const toRoot = root.matrixWorld.clone().invert(), found = new Map<Role, { list: T.BufferGeometry[]; pivot: T.Vector3 }>();
+  let height = 0;
+  root.traverse(o => {
+    if (!(o instanceof T.Mesh) || Array.isArray(o.material)) return;
+    let named: T.Object3D | null = o; while (named && named !== root && !PART_NAME.test(named.name)) named = named.parent;
+    const own = !!named && named !== root, role = (own ? PART_NAME.exec(named!.name)![1] : 'body') as Role;
+    const pivot = own ? new T.Vector3().setFromMatrixPosition(toRoot.clone().multiply(named!.matrixWorld)) : new T.Vector3();
+    let g = new T.BufferGeometry(); g.setAttribute('position', o.geometry.getAttribute('position').clone());
+    const normal = o.geometry.getAttribute('normal'); if (normal) g.setAttribute('normal', normal.clone());
+    if (o.geometry.index) g.setIndex(o.geometry.index.clone());
+    g = g.index ? g.toNonIndexed() : g;
+    g.applyMatrix4(toRoot.clone().multiply(o.matrixWorld)); if (!normal) g.computeVertexNormals();
+    g.computeBoundingBox(); height = Math.max(height, g.boundingBox!.max.y);
+    const material = o.material as T.MeshStandardMaterial, n = g.getAttribute('position').count, colors = new Float32Array(n * 3), mask = new Float32Array(n);
+    let color = material.color ?? new T.Color('#ffffff');
+    // A coat part keeps only its shade (relative to the coat's own colour); the breed colour comes per instance.
+    const coat = coats[material.name] ?? coats['#' + color.getHexString()];
+    if (coat) { const base = new T.Color(coat[1]), shade = Math.min(1.2, Math.max(.5, (color.r + color.g + color.b) / Math.max(1e-3, base.r + base.g + base.b))); color = new T.Color(shade, shade, shade); mask.fill(coat[0]); }
+    for (let i = 0; i < n; i++) colors.set([color.r, color.g, color.b], i * 3);
+    g.setAttribute('color', new T.BufferAttribute(colors, 3)); g.setAttribute('coatMask', new T.BufferAttribute(mask, 1));
+    const entry = found.get(role) ?? { list: [], pivot }; entry.list.push(g); found.set(role, entry);
+  });
+  const quadruped = [...found.keys()].some(r => r.startsWith('leg_f')), legs = ROLES.filter(r => r.startsWith('leg_') && found.has(r));
+  const drawOf = (r: Role): Part['draw'] => r === 'head' ? 'head' : r.startsWith('leg_') ? 'legs' : r === 'tail' && quadruped ? 'tail' : 'body';
+  const merge = (list: T.BufferGeometry[], at: T.Vector3) => { const g = list.length > 1 ? mergeGeometries(list, false) : list[0]; if (!g) return null; g.translate(-at.x, -at.y, -at.z); g.userData.sharedKit = true; g.computeBoundingSphere(); return g; };
+  const parts: Part[] = [];
+  for (const draw of ['body', 'head', 'tail'] as const) {
+    const roles = ROLES.filter(r => found.has(r) && drawOf(r) === draw); if (!roles.length) continue;
+    const at = found.get(roles.includes(draw) ? draw : roles[0])!.pivot.clone(), list = roles.flatMap(r => found.get(r)!.list);
+    const geometry = merge(list, draw === 'body' ? at : found.get(roles[0])!.pivot);
+    if (geometry) parts.push({ draw, geometry, pivots: [{ at, sign: 1 }] });
+  }
+  if (legs.length) {
+    // One leg's shape serves them all (the legs are mirror twins); the rest are only freed.
+    const first = found.get(legs[0])!, geometry = merge(first.list, first.pivot);
+    for (const r of legs.slice(1)) found.get(r)!.list.forEach(g => g.dispose());
+    if (geometry) parts.push({ draw: 'legs', geometry, pivots: legs.map(r => ({ at: found.get(r)!.pivot.clone(), sign: r === 'leg_l' || r === 'leg_fl' || r === 'leg_br' ? 1 : -1 })) });
+  }
+  return { parts, height };
+}
+
+/** Wander goal in the yard oval, off the props and the keep-outs; `near` biases it to a short stroll from there. */
+export function penGoal(rng: () => number, margin = .45, keep: readonly KeepOut[] = [], near?: { x: number; z: number }): { x: number; z: number } {
+  for (let i = 0; i < 24; i++) {
+    let x: number, z: number;
+    if (near && i < 12) { const a = rng() * Math.PI * 2, d = 1 + rng() * 2.2; ({ x, z } = intoYard(near.x + Math.sin(a) * d, near.z + Math.cos(a) * d, margin)); }
+    else { const a = rng() * Math.PI * 2, d = Math.sqrt(rng()); x = Math.sin(a) * d * (YARD.rx - margin); z = Math.cos(a) * d * (YARD.rz - margin); }
+    if (PEN_PROPS.every(p => Math.hypot(x - p.x, z - p.z) > p.r + margin * .5) && keep.every(k => Math.hypot(x - k.x, z - k.z) > k.r + margin * .5)) return { x, z };
+  }
+  return { x: 0, z: .6 };
+}
+
+/** Where animals may go when no world says otherwise (tests, a bare view): the yard oval off the pen's props. */
+export function yardArea(): RoamArea {
+  return { home: { x: PEN.x, z: PEN.z, rx: YARD.rx, rz: YARD.rz }, radius: 16,
+    blocked: (x, z, r) => ((x - PEN.x) / (YARD.rx - r)) ** 2 + ((z - PEN.z) / (YARD.rz - r)) ** 2 > 1 || PEN_PROPS.some(p => Math.hypot(x - PEN.x - p.x, z - PEN.z - p.z) < p.r + r) };
+}
+
+export class FarmPenView {
+  /** The baked fence, gate, coop, troughs, hay and floor; the world uses it as the pen entity's mesh. */
+  readonly statics = new T.Group();
+  /** Animals and product markers, inside `statics` (pen-local metres). */
+  readonly animals = new T.Group();
+  private rigs = new Map<ModelId, Rig>();
+  private meshes = new Map<string, T.InstancedMesh>();
+  private walkers = new Map<number, Walker>();
+  private flights: Array<{ product: ProductId; x: number; y: number; z: number; t: number }> = [];
+  private guard: { uid: number; target: { x: number; z: number }; follow?: () => { x: number; z: number } | null; remaining: number; bite: number; repath: number; route: { x: number; z: number }[] } | null = null;
+  private biteFlash?: T.Mesh<T.RingGeometry, T.MeshBasicMaterial>;
+  private rng: () => number;
+  private kitUsed = false;
+  private built = true;
+  private speciesPens: FarmState['speciesPens'] = {};
+  private pensSeen: Array<number | undefined> = [];
+  /** Seconds since the pen was built here (drives the pop-in of the yard); Infinity when it was already standing. */
+  private buildT = Infinity;
+  private area: RoamArea = { ...yardArea(), leash: this.leash() };
+  private baseArea?: RoamArea;
+  /** The dog's leash (world metres): tied in front of its dog house, or the pen's front. */
+  private leash() { const s = leashSpot(PEN, this.speciesPens?.dog); return { x: s.x, z: s.z, r: DOG_LEASH }; }
+  /** The guard dog is out with the explorer (guard-dog.ts): the pen neither moves nor draws it meanwhile. */
+  private dogAway = false;
+  /** Sends the dog out (true) or takes it back at (x, z) (false). */
+  setDogAway(away: boolean, at?: { x: number; z: number }) {
+    if (away === this.dogAway) return; this.dogAway = away; this.poseDirty = true;
+    const dog = [...this.walkers.values()].find(w => w.kind === 'dog');
+    if (dog && !away && at && Number.isFinite(at.x) && Number.isFinite(at.z)) { dog.x = at.x; dog.z = at.z; dog.walking = false; dog.speed = 0; dog.path = []; dog.dest = null; dog.rest = 'look'; dog.restT = 1.5; }
+    if (dog && away && this.guard?.uid === dog.uid) this.guard = null;
+  }
+  get isDogAway() { return this.dogAway; }
+  /** Where the pen has its dog now (world metres), or null without one. */
+  dogSpot() { const dog = [...this.walkers.values()].find(w => w.kind === 'dog'); return dog ? { x: dog.x, z: dog.z, heading: dog.heading } : null; }
+  private readonly mobile: boolean;
+  private poseDt = 0;
+  private poseDirty = true;
+  private m = new T.Matrix4(); private q = new T.Quaternion(); private e = new T.Euler(); private v = new T.Vector3(); private one = new T.Vector3(1, 1, 1);
+  private root = new T.Matrix4(); private local = new T.Matrix4(); private s = new T.Vector3(); private v2 = new T.Vector3();
+  constructor(seed = 7, options: { mobile?: boolean } = {}) {
+    this.mobile = options.mobile ?? detectEnvironment().mobile;
+    let state = seed >>> 0; this.rng = () => ((state = (state * 1664525 + 1013904223) >>> 0) / 4294967296);
+    // The animals live inside the pen group (pen-local), which the world keeps out of its scenery batches.
+    this.statics.name = 'farm-pen'; this.animals.name = 'farm-animals'; this.statics.position.set(PEN.x, 0, PEN.z); this.statics.add(this.animals);
+    this.buildStatics();
+  }
+  /** True once farm.glb is drawn (false while the stand-ins show). */
+  get usesKit() { return this.kitUsed; }
+  /** Re-dress with farm.glb once it has loaded. */
+  /** Marked plot (false) or the built yard; `animate` pops the yard up as it is built. */
+  setBuilt(built: boolean, animate = false) {
+    if (built === this.built) return;
+    this.built = built; this.buildT = animate && built ? 0 : Infinity; this.poseDirty = true; this.disposeStatics(); this.buildStatics();
+  }
+  get isBuilt() { return this.built; }
+  /** Where the animals may roam (the world's village ground). */
+  setArea(area: RoamArea) {
+    this.baseArea = area;
+    this.area = { ...area, leash: this.leash(), blocked: (x,z,r) => area.blocked(x,z,r) || !!this.speciesPens?.dog && Math.hypot(x-this.speciesPens.dog.x,z-this.speciesPens.dog.z) < r+.45 };
+  }
+  /** Rebuild shelter props only when the saved placement changes, not every animation frame. */
+  setSpeciesPens(pens: FarmState['speciesPens']) {
+    // Called every step: compare the numbers in place (a JSON string per step was garbage for nothing).
+    let same = this.pensSeen.length === ANIMAL_KINDS.length * 2;
+    for (let i = 0; same && i < ANIMAL_KINDS.length; i++) same = this.pensSeen[i * 2] === pens?.[ANIMAL_KINDS[i]]?.x && this.pensSeen[i * 2 + 1] === pens?.[ANIMAL_KINDS[i]]?.z;
+    if (same) return;
+    this.pensSeen = ANIMAL_KINDS.flatMap(kind => [pens?.[kind]?.x, pens?.[kind]?.z]); this.speciesPens = structuredClone(pens ?? {}); if (this.baseArea) this.setArea(this.baseArea); else this.area.leash = this.leash();
+    this.disposeStatics(); this.buildStatics();
+  }
+  refresh() {
+    if (this.kitUsed === farmKit.ready) return;
+    this.disposeStatics(); this.disposeAnimals(); this.buildStatics(); this.poseDirty = true;
+  }
+  private buildStatics() {
+    this.kitUsed = farmKit.ready;
+    const g = new T.Group();
+    if (!this.built) { this.statics.add(bakeModel(this.plotMarker())); return; }
+    // A sandy floor the size of the yard oval and a low fence behind it only (BACK_FENCE): the front and sides stay
+    // open so the animals roam freely and nothing hides them from the camera.
+    const floor = new T.Mesh(new T.CircleGeometry(1, 36), new T.MeshStandardMaterial({ color: '#efc879' })); floor.rotation.x = -Math.PI / 2; floor.scale.set(YARD.rx + .2, YARD.rz + .2, 1); floor.position.y = .015; floor.receiveShadow = true; g.add(floor);
+    const pieces: Array<[string, number, number, number]> = [];
+    for (const x of BACK_FENCE) pieces.push(['pen_fence', x, BACK_FENCE_Z, 0]);
+    for (const p of PEN_PROPS) pieces.push([p.id, p.x, p.z, p.rot]);
+    for (const [id, x, z, rot] of pieces) { const piece = model(id, false); piece.position.set(x, 0, z); piece.rotation.y = rot; piece.traverse(o => { if (o instanceof T.Mesh) { o.castShadow = id !== 'pen_fence'; o.receiveShadow = true; } }); g.add(piece); }
+    for (const kind of ANIMAL_KINDS) { const at=this.speciesPens?.[kind]; if(at) { const shelter=model(`${kind}_shelter`,false); shelter.position.set(at.x-PEN.x,0,at.z-PEN.z);g.add(shelter); } }
+    // A fresh copy so baking never touches the kit's shared meshes; same-look parts merge into a few draws.
+    this.statics.add(bakeModel(g));
+  }
+  /**
+   * The unbuilt site: a pale dirt patch roped off by four stakes, and a sign with a hen on it, so the spot reads as
+   * "something goes here" without looking like a building.
+   */
+  private plotMarker() {
+    const g = new T.Group(), mat = (color: string) => new T.MeshStandardMaterial({ color });
+    const patch = new T.Mesh(new T.CircleGeometry(1, 28), mat('#e3cf9a')); patch.rotation.x = -Math.PI / 2; patch.scale.set(PEN.hw * .9, PEN.hd * .9, 1); patch.position.y = .012; patch.receiveShadow = true; g.add(patch);
+    const hw = PEN.hw * .8, hd = PEN.hd * .8, corners: Array<[number, number]> = [[-hw, -hd], [hw, -hd], [hw, hd], [-hw, hd]];
+    for (const [x, z] of corners) g.add(box('#a8714a', .1, .55, .1, x, .27, z), box('#ff7a59', .14, .08, .14, x, .55, z));
+    for (let i = 0; i < 4; i++) {
+      const [ax, az] = corners[i], [bx, bz] = corners[(i + 1) % 4], len = Math.hypot(bx - ax, bz - az), rope = box('#f6e3b4', len, .035, .035, (ax + bx) / 2, .42, (az + bz) / 2);
+      rope.rotation.y = -Math.atan2(bz - az, bx - ax); g.add(rope);
+    }
+    // The sign faces the garden (south, toward the camera).
+    g.add(box('#8a5a3b', .12, 1.1, .12, 0, .55, hd * .2), box('#f2cf5b', 1.15, .62, .08, 0, 1.08, hd * .2 + .07), box('#c98f5a', 1.25, .08, .1, 0, 1.42, hd * .2 + .07));
+    g.add(ball('#fffaf0', .17, 0, 1.05, hd * .2 + .14, 1.1, .9, .4), ball('#ff4a4a', .05, .08, 1.24, hd * .2 + .15, .8, 1, .5), ball('#ffaa2b', .04, .18, 1.08, hd * .2 + .16, 1.2, .7, .5));
+    g.traverse(o => { if (o instanceof T.Mesh) { o.castShadow = o !== patch; o.receiveShadow = true; } });
+    return g;
+  }
+  /** Where an animal stands (world metres), for bursts and floating text; null if unknown. */
+  positionOf(uid: number) { const w = this.walkers.get(uid); return w ? { x: w.x, z: w.z } : null; }
+  /** Resolve a visible instanced body/product hit to its live animal, without confusing collection effects. */
+  pickAnimal(raycaster: T.Raycaster): number | null {
+    this.statics.updateWorldMatrix(true,true);
+    const meshes=[...this.meshes.values()].filter(mesh=>mesh.visible&&mesh.count>0);
+    // Instances move every frame; raycast bounds must be refreshed at the tap, not cached at their spawn point.
+    for(const mesh of meshes)mesh.computeBoundingSphere();
+    for(const hit of raycaster.intersectObjects(meshes,false)){
+      const uid=hit.instanceId===undefined?undefined:hit.object.userData.animalUids?.[hit.instanceId];
+      if(typeof uid==='number'&&this.walkers.has(uid))return uid;
+    }
+    return null;
+  }
+  /** Presentation only: the server decides theft and damage before the guardian gives chase. */
+  guardBite(target: { x: number; z: number }, follow?: () => { x: number; z: number } | null) {
+    const dog = this.dogAway ? undefined : [...this.walkers.values()].find(w => w.kind === 'dog');
+    if (!dog || !Number.isFinite(target.x) || !Number.isFinite(target.z)) return false;
+    this.guard = { uid: dog.uid, target: { ...target }, follow, remaining: 6, bite: -1, repath: 0, route: [] };
+    this.poseDirty = true;
+    dog.path=[]; dog.dest=null; dog.walking=true; dog.rest='none'; dog.restT=0; dog.flee=6;
+    return true;
+  }
+  /** Visual-only pursuit: never changes HP, rewards or theft permissions. */
+  private stepGuard(w: Walker, dt: number) {
+    const g=this.guard;if(!g||g.uid!==w.uid)return false;
+    const followed=g.follow?.();
+    if(g.follow&&(!followed||!Number.isFinite(followed.x)||!Number.isFinite(followed.z))){this.guard=null;w.walking=false;w.speed=0;return false;}
+    if(followed)g.target={...followed};
+    const dx=g.target.x-w.x,dz=g.target.z-w.z,d=Math.hypot(dx,dz);
+    g.remaining-=dt;
+    if(g.bite<0&&(d<1.15||g.remaining<=0)){g.bite=0;w.walking=false;w.speed=0;w.flee=.6;w.heading=Math.atan2(dx,dz);}
+    if(g.bite>=0){
+      g.bite+=dt;w.walking=false;w.speed=0;
+      if(g.bite>=.45){this.guard=null;w.rest='look';w.restT=2;w.flee=.6;}
+      return true;
+    }
+    // Stop short of the player's body. Refresh the bounded route as the thief moves.
+    const stop=Math.max(0,d-.9),goal={x:w.x+dx/Math.max(.001,d)*stop,z:w.z+dz/Math.max(.001,d)*stop};
+    g.repath-=dt;
+    if(segmentClear(this.area,w.x,w.z,goal.x,goal.z,.45))g.route=[goal];
+    else if(g.repath<=0){g.repath=.4;g.route=this.area.route?.(w.x,w.z,goal.x,goal.z,.45)??[];}
+    while(g.route.length&&Math.hypot(g.route[0].x-w.x,g.route[0].z-w.z)<.08)g.route.shift();
+    const next=g.route[0];w.walking=!!next;w.speed=next?3.8:0;w.rest='none';w.flee=1;
+    if(next){const gx=next.x-w.x,gz=next.z-w.z,dist=Math.hypot(gx,gz),step=Math.min(dist,3.8*dt),x=w.x+gx/Math.max(.001,dist)*step,z=w.z+gz/Math.max(.001,dist)*step;
+      if(segmentClear(this.area,w.x,w.z,x,z,.45)){w.x=x;w.z=z;w.heading=Math.atan2(gx,gz);}else{g.route=[];g.repath=0;w.speed=0;}}
+    return true;
+  }
+  /** Every animal in world metres with its kind, so a tap on any animal can stand for a tap on the pen. */
+  positions() { return [...this.walkers.values()].map(w => ({ uid: w.uid, kind: w.kind, adult: w.model === w.kind, expired: w.expired, x: w.x, z: w.z })); }
+  /** What each animal is doing (for probes and tests): walking, or the kind of rest. */
+  activities() { return [...this.walkers.values()].map(w => ({ uid: w.uid, kind: w.kind, young: w.young, expired: w.expired, walking: w.walking, rest: w.rest, x: w.x, z: w.z })); }
+  private player: { x: number; z: number } | null = null;
+  /** Scratch for `player`, so update() allocates nothing per frame. */
+  private playerAt = { x: 0, z: 0 };
+  /** A collected product flies up from its animal and shrinks (like a harvested crop). */
+  collect(uid: number, product?: string, origin?: { x: number; z: number }) {
+    const w = this.walkers.get(uid),at=w??origin;if(!at||!Number.isFinite(at.x)||!Number.isFinite(at.z))return;
+    const item = product === 'meat' || product === 'egg' || product === 'milk' || product === 'duck_egg' || product === 'truffle' ? product : !w || w.expired ? 'meat' : PRODUCT[w.kind];
+    // A committed online meat pickup may remove its walker before the HTTP reply animates it.
+    this.flights.push({ product: item, x: at.x - PEN.x, y: item === 'meat' ? .3 : w?this.rigOf(w.model).height + .2:.6, z: at.z - PEN.z, t: 0 });
+    this.poseDirty = true;
+  }
+  private hips = new Map<ModelId, number>();
+  /** Hip height of a model's legs in its own units (the highest leg hinge), for the speed-true gait. */
+  private hipOf(id: ModelId) { let h = this.hips.get(id); if (h === undefined) { const legs = this.rigOf(id).parts.find(p => p.draw === 'legs'); h = legs ? Math.max(.1, ...legs.pivots.map(v => v.at.y)) : .4; this.hips.set(id, h); } return h; }
+  private rigOf(id: ModelId) { let r = this.rigs.get(id); if (!r) { const src = model(id, true); r = rigOf(src, COAT_PARTS[id]); this.rigs.set(id, r); this.disposeSource(src); } return r; }
+  /** Frees a stand-in model once its parts are merged; a kit instance shares the kit's geometry and materials. */
+  private disposeSource(src: T.Object3D) { src.traverse(o => { if (o instanceof T.Mesh) { if (!o.geometry.userData.sharedKit) o.geometry.dispose(); const m = o.material as T.Material; if (!m.userData.sharedKit) m.dispose(); } }); }
+  private mesh(key: string, geometry: T.BufferGeometry, max: number, shadow: boolean, material: T.Material = animalMaterial()) {
+    let m = this.meshes.get(key);
+    if (!m) {
+      // Animal parts carry their breed colours per instance (see animalMaterial).
+      if (material === sharedMaterial) { geometry.setAttribute('coatA', new T.InstancedBufferAttribute(new Float32Array(max * 4), 4)); geometry.setAttribute('coatB', new T.InstancedBufferAttribute(new Float32Array(max * 3), 3)); }
+      m = new T.InstancedMesh(geometry, material, max); m.name = `farm-${key}`; m.castShadow = shadow; m.receiveShadow = true; m.frustumCulled = false; m.count = 0; m.userData.animalUids=[];
+      m.userData.coats = new Int16Array(max).fill(-1); m.userData.coatStart = Infinity; m.userData.coatEnd = 0;
+      this.meshes.set(key, m); this.animals.add(m); }
+    return m;
+  }
+  private productMesh(product: ProductId) {
+    const key = `product:${product}`; if (this.meshes.has(key)) return this.meshes.get(key)!;
+    const src = model(product, false), rig = rigOf(src); this.disposeSource(src);
+    const moved = rig.parts.map(p => p.geometry.translate(p.pivots[0].at.x, p.pivots[0].at.y, p.pivots[0].at.z)), geometry = (moved.length > 1 ? mergeGeometries(moved, false) : null) ?? moved[0];
+    for (const g of moved) if (g !== geometry) g.dispose(); geometry.userData.sharedKit = true;
+    // Products glow a little so a waiting egg reads against the sand.
+    const material = toonMaterial({ vertexColors: true, emissive: '#fff4c2', emissiveIntensity: .25 }); material.userData.sharedKit = true;
+    return this.mesh(key, geometry, MAX_PRODUCTS, false, material);
+  }
+  /** Keeps a walker per animal (new ones pop in at the gate side); forgets the ones that left. */
+  private syncWalkers(list: readonly Animal[], now: number) {
+    const keep = new Set<number>(); let changed = false;
+    for (const a of list) {
+      keep.add(a.uid); const model = modelOf(a, now); let w = this.walkers.get(a.uid);
+      if (!w) {
+        const young = model !== a.kind, leash = a.kind === 'dog' ? this.area.leash : undefined, spot = leash ? { x: leash.x, z: leash.z } : spawnSpot(this.area, this.rng, a.kind, young, [...this.walkers.values()]);
+        w = { ...newRoamer(a.uid, a.kind, young, spot, this.rng), model, expired: expired(a, now), ready: productReady(a, now), phase: this.rng() * 6, pop: 0, size: .94 + this.rng() * .12, seed: this.rng() * 10, coat: 0, lodT: 0, lodDt: 0, seen: true };
+        this.walkers.set(a.uid, w); changed = true;
+      }
+      const dead = expired(a, now), ready = productReady(a, now), coat = coatOf(a);
+      if (w.expired !== dead || w.ready !== ready || w.coat !== coat || w.model !== model) changed = true;
+      w.expired = dead; w.ready = ready; w.coat = coat;
+      if (w.expired) { w.walking = false; w.speed = 0; w.rest = 'none'; w.path = []; }
+      if (w.model !== model) { w.model = model; w.young = model !== a.kind; w.pop = 0; }
+    }
+    for (const uid of this.walkers.keys()) if (!keep.has(uid)) { this.walkers.delete(uid); changed = true; }
+    return changed;
+  }
+  private camera: T.Camera | null = null;
+  private frustum = new T.Frustum(); private sphere = new T.Sphere(); private grid = new RoamGrid(); private live: Walker[] = [];
+  /** The camera whose view decides which animals are posed (offscreen ones are not) and which think less often. */
+  setCamera(camera: T.Camera) { this.camera = camera; }
+  /** Seconds between thinking steps: every frame near the explorer and on screen, ~10 a second far away or off it. */
+  private lodStep(w: Walker, seen: boolean) {
+    if (w.flee > 0 || !this.player) return 0;
+    const d = Math.hypot(w.x - this.player.x, w.z - this.player.z);
+    return !seen ? .1 : d > 22 ? .1 : d > 14 ? .05 : 0;
+  }
+  /** Whether an animal (a sphere round its body, world metres) is inside the camera's view; true without a camera. */
+  private onScreen(w: Walker) {
+    if (!this.camera) return true;
+    this.sphere.center.set(w.x, w.kind === 'cow' ? .8 : .3, w.z); this.sphere.radius = w.kind === 'cow' ? 1.6 : .7;
+    return this.frustum.intersectsSphere(this.sphere);
+  }
+  /** Mobile holds crisp, full-detail poses between 20 Hz updates (30 Hz during short interaction effects). */
+  update(list: readonly Animal[], dt: number, time: number, now = Date.now(), player?: { x: number; z: number }) {
+    // Production, growth and removal still use real time on every call, including calls between poses.
+    const changed = this.syncWalkers(list, now); this.poseDt += dt;
+    const interval = this.guard || this.flights.length ? 1 / 30 : 1 / 20;
+    if (this.mobile && !changed && !this.poseDirty && this.poseDt < interval - 1e-9) return;
+    dt = this.poseDt; this.poseDt = 0; this.poseDirty = false;
+    const calm = this.mobile ? .45 : 1, idleTime = time * (this.mobile ? .6 : 1);
+    if (player) { this.playerAt.x = player.x; this.playerAt.z = player.z; } this.player = player ? this.playerAt : null;
+    if (this.camera) { this.camera.updateMatrixWorld(); this.frustum.setFromProjectionMatrix(this.m.multiplyMatrices(this.camera.projectionMatrix, this.camera.matrixWorldInverse)); }
+    if (this.buildT < 1) { this.buildT += dt; const k = Math.min(1, this.buildT / .6), s = k < 1 ? k * (1 + Math.sin(k * Math.PI) * .25) : 1; for (const c of this.statics.children) if (c !== this.animals) c.scale.set(1, Math.max(.01, s), 1); }
+    const walkers = this.live; walkers.length = 0; for (const w of this.walkers.values()) if (!w.expired && !(this.dogAway && w.kind === 'dog')) walkers.push(w);
+    this.grid.build(walkers);
+    // Far or offscreen animals think a few times a second with the gathered time (their walks stay on the same line).
+    for (let n = 0; n < walkers.length; n++) {
+      const w = walkers[n]; w.seen = this.onScreen(w); w.lodDt += dt; w.lodT -= dt; if (w.lodT > 0) continue;
+      w.lodT = this.lodStep(w, w.seen); const step=Math.min(w.lodDt,.25);
+      // Casual roaming is calmer on phones; fleeing and guard pursuit retain their normal pace.
+      if(!this.stepGuard(w,step))stepRoamer(w, walkers, this.area, this.rng, step * (this.mobile && w.flee <= 0 ? .6 : 1), this.player, this.grid); w.lodDt = 0;
+    }
+    // Four-legged animals step by the ground they cover (a speed-true gait: each half swing carries the body one step of
+    // 2 x hip height x sin(swing)), so the hooves no longer paddle long strides while the body barely moves. Birds keep their quick patter.
+    for (let n = 0; n < walkers.length; n++) { const w = walkers[n], pace = this.mobile && w.flee <= 0 ? .6 : 1;
+      if (QUADRUPED.has(w.kind)) { const step = 2 * this.hipOf(w.model) * SHOWN[w.kind] * w.size * Math.sin(LEG_SWING[w.kind] ?? .35); w.phase += w.speed * dt * pace / Math.max(.05, step) * Math.PI; }
+      else w.phase += dt * 16 * Math.min(1, w.speed / .3) * pace; }
+    for (const m of this.meshes.values()) { m.count = 0; m.userData.animalUids.length=0; }
+    for (let n = 0; n < list.length; n++) {
+      const a = list[n], w = this.walkers.get(a.uid)!;
+      if (this.dogAway && a.kind === 'dog') continue;
+      if (w.expired) {
+        const marker = this.productMesh('meat'), i = marker.count;
+        if (i < MAX_PRODUCTS) { marker.setMatrixAt(i, this.m.compose(this.v.set(w.x - PEN.x, .15 + Math.sin(idleTime * 3 + w.seed) * .05 * calm, w.z - PEN.z), this.q.setFromEuler(this.e.set(0, idleTime * .7 + w.seed, 0)), this.s.setScalar(1.6))); marker.userData.animalUids[i]=a.uid; marker.count = i + 1; }
+        continue;
+      }
+      const rig = this.rigOf(w.model), cow = a.kind === 'cow', young = w.model !== a.kind;
+      w.pop = Math.min(1, w.pop + dt * 2.5);
+      // Offscreen animals are not posed at all (no matrices written, nothing drawn).
+      if (!w.seen) continue;
+      const coat = this.coatColors(w.model, w.coat), coatA = coat[0], coatB = coat[1], fleck = coat[2];
+      const pop = w.pop < 1 ? Math.min(1, w.pop * 2) * (1 + Math.sin(w.pop * Math.PI * 2.5) * (1 - w.pop) * .35) : 1;
+      // Young ones grow a little toward adult size before they change model.
+      const scale = SHOWN[a.kind] * w.size * pop * (young ? .85 + growth(a, now) * .3 : 1), moving = w.speed > .05;
+      // Hens hop a little as they walk; a sitting or dust-bathing hen settles onto the ground (and wobbles in the dust).
+      const bob = moving ? Math.abs(Math.sin(w.phase)) * (cow ? .03 : .05) * calm : 0, settle = cow ? 0 : -w.sit * .13 * scale, dust = w.rest === 'dust' ? Math.sin(idleTime * 13 + w.seed) * .18 * w.sit * calm : 0;
+      const bite=this.guard?.uid===w.uid&&this.guard.bite>=0?Math.sin(this.guard.bite/.45*Math.PI):0;
+      this.root.compose(this.v.set(w.x - PEN.x+Math.sin(w.heading)*bite*.35, bob + settle + bite*.2, w.z - PEN.z+Math.cos(w.heading)*bite*.35), this.q.setFromEuler(this.e.set(-bite*.22, w.heading, dust)), this.s.setScalar(scale));
+      const swing = moving ? Math.sin(w.phase) * (QUADRUPED.has(a.kind) ? (LEG_SWING[a.kind] ?? .35) * Math.min(1, w.speed / .25) : .7) : 0;
+      // A hop when a hen flaps; a little sway of the body while walking.
+      for (let k = 0; k < rig.parts.length; k++) { const p = rig.parts[k];
+        if (!p.mesh) {
+          // Only bodies cast shadows: a head's shadow merges into the body's at this camera, and it saves a shadow draw per model.
+          p.mesh = this.mesh(`${w.model}:${p.draw}`, p.geometry, MAX_PER_MODEL[w.model] * (p.draw === 'legs' ? MAX_LEGS : 1), p.draw === 'body');
+          p.coatA = p.geometry.getAttribute('coatA') as T.InstancedBufferAttribute; p.coatB = p.geometry.getAttribute('coatB') as T.InstancedBufferAttribute;
+        }
+        const mesh = p.mesh, max = mesh.instanceMatrix.count;
+        for (let j = 0; j < p.pivots.length; j++) { const at = p.pivots[j].at, sign = p.pivots[j].sign;
+          let rx = 0, ry = 0, rz = 0;
+          // Grazing: head down to the grass with a slow chew; pecking: a quick dip.
+          if (p.draw === 'head') { rx = Math.max(w.peck * .9, w.graze * (cow ? .75 : .6)) + (w.graze * Math.sin(idleTime * 6 + w.seed) * .06 + Math.sin(idleTime * 2 + w.seed) * .05) * calm + bite*.75; ry = Math.sin(idleTime * .7 + w.seed) * .15 * (1 - w.graze * .6) * calm; }
+          else if (p.draw === 'legs') rx = sign * swing;
+          else if (p.draw === 'tail') ry = a.kind === 'dog' ? Math.sin(idleTime * (w.rest === 'look' || moving ? 11 : 6) + w.seed) * .5 * calm : Math.sin(idleTime * 3 + w.seed) * .35 * calm;
+          else rz = moving ? Math.sin(w.phase) * .04 * calm : 0;
+          this.local.compose(this.v2.copy(at).setY(at.y + (p.draw === 'legs' ? 0 : w.flap * .08)), this.q.setFromEuler(this.e.set(rx, ry, rz)), this.one);
+          const i = mesh.count; if (i >= max) continue;
+          mesh.setMatrixAt(i, this.m.multiplyMatrices(this.root, this.local)); mesh.userData.animalUids[i]=a.uid; mesh.count = i + 1;
+          // Coats do not animate. Upload only changed slots, including reordered or newly visible animals.
+          if (mesh.userData.coats[i] !== w.coat) {
+            mesh.userData.coats[i] = w.coat;
+            p.coatA?.setXYZW(i, coatA.r, coatA.g, coatA.b, fleck); p.coatB?.setXYZ(i, coatB.r, coatB.g, coatB.b);
+            mesh.userData.coatStart = Math.min(mesh.userData.coatStart, i); mesh.userData.coatEnd = i + 1;
+          }
+        }
+      }
+      if (w.ready) {
+        const marker = this.productMesh(PRODUCT[a.kind]), i = marker.count, y = rig.height * scale + .25 + Math.sin(idleTime * 3 + w.seed) * .06 * calm;
+        if (i < MAX_PRODUCTS) { marker.setMatrixAt(i, this.m.compose(this.v.set(w.x - PEN.x, y, w.z - PEN.z), this.q.setFromEuler(this.e.set(0, idleTime * 1.5 + w.seed, 0)), this.s.setScalar(1.6))); marker.userData.animalUids[i]=a.uid; marker.count = i + 1; }
+      }
+    }
+    const biting=this.guard&&this.guard.bite>=0?this.walkers.get(this.guard.uid):null;
+    if(biting&&this.guard){
+      if(!this.biteFlash){this.biteFlash=new T.Mesh(new T.RingGeometry(.2,.35,12),new T.MeshBasicMaterial({color:'#ffbd65',transparent:true,opacity:.9,depthWrite:false,side:T.DoubleSide}));this.biteFlash.name='guard-bite-flash';this.biteFlash.rotation.x=-Math.PI/2;this.animals.add(this.biteFlash);}
+      const phase=this.guard.bite/.45;this.biteFlash.visible=true;this.biteFlash.position.set(biting.x-PEN.x+Math.sin(biting.heading)*.8,.55,biting.z-PEN.z+Math.cos(biting.heading)*.8);this.biteFlash.scale.setScalar(.7+phase*2.5);this.biteFlash.material.opacity=.9*(1-phase);
+    }else if(this.biteFlash)this.biteFlash.visible=false;
+    for (let i = this.flights.length - 1; i >= 0; i--) {
+      const f = this.flights[i]; f.t += dt; const k = f.t / .45;
+      if (k >= 1) { this.flights.splice(i, 1); continue; }
+      const marker = this.productMesh(f.product), n = marker.count; if (n >= MAX_PRODUCTS) continue;
+      const s = 1.6 * (1.4 - k * 1.2);
+      marker.setMatrixAt(n, this.m.compose(this.v.set(f.x, f.y + Math.sin(k * Math.PI) * 1.6, f.z), this.q.setFromEuler(this.e.set(0, k * 12, 0)), this.s.setScalar(s))); marker.count = n + 1;
+    }
+    for (const m of this.meshes.values()) {
+      m.visible = m.count > 0;
+      if (m.count) { m.instanceMatrix.clearUpdateRanges(); m.instanceMatrix.addUpdateRange(0, m.count * 16); m.instanceMatrix.needsUpdate = true; }
+      const start = m.userData.coatStart, end = m.userData.coatEnd;
+      if (end > start) for (let j = 0; j < COAT_ATTRS.length; j++) {
+        const at = m.geometry.getAttribute(COAT_ATTRS[j]) as T.InstancedBufferAttribute | undefined;
+        if (at) { at.addUpdateRange(start * at.itemSize, (end - start) * at.itemSize); at.needsUpdate = true; }
+      }
+      m.userData.coatStart = Infinity; m.userData.coatEnd = 0;
+    }
+  }
+  /** Linear colours for a breed of a model (an unknown index wears the first breed). */
+  private coatColors(id: ModelId, coat: number) { const list = COAT_COLORS[id]; return list[coat] ?? list[0]; }
+  /** Which breed each animal shows (for probes and tests). */
+  coats() { return [...this.walkers.values()].map(w => ({ uid: w.uid, model: w.model, coat: w.coat })); }
+  /** Draw calls the pen costs this frame (statics + visible instanced parts). */
+  get draws() { let n = 0; this.statics.traverse(o => { if (o instanceof T.Mesh && !(o instanceof T.InstancedMesh) && o.visible && o.layers.isEnabled(0)) n++; }); for (const m of this.meshes.values()) if (m.visible) n++; return n; }
+  private disposeStatics() { for (const c of [...this.statics.children]) { if (c === this.animals) continue; c.removeFromParent(); c.traverse(o => { if (o instanceof T.Mesh) { if (!o.geometry.userData.sharedKit) o.geometry.dispose(); const m = o.material as T.Material; if (!m.userData.sharedKit) m.dispose(); } }); } }
+  private disposeAnimals() {
+    for (const m of this.meshes.values()) { m.removeFromParent(); m.dispose(); m.geometry.dispose(); if (m.material !== sharedMaterial) (m.material as T.Material).dispose(); }
+    this.meshes.clear(); this.rigs.clear();
+  }
+  dispose() { this.disposeStatics(); this.disposeAnimals();if(this.biteFlash){this.biteFlash.geometry.dispose();this.biteFlash.material.dispose();this.biteFlash.removeFromParent();this.biteFlash=undefined;}this.guard=null; this.statics.removeFromParent(); this.animals.removeFromParent(); this.walkers.clear(); this.flights = []; }
+}
