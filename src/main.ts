@@ -1107,9 +1107,11 @@ const drops=createDrops(world,{layer:$('#world-labels'),alive:()=>state.hp>0&&!w
   canAdd:(id,n)=>Number.isSafeInteger((state.bag[id]??0)+n)&&M.canAddItem(state,id,n),onPick:(d,stack)=>{
     const feedback=(id:string,count:number)=>{floating('+'+count+' '+t(M.ITEMS[id].name),world.position.x,world.position.z,'item',stack*.7);tone('coin');};
     if(actionHandler){const meta=networkDrops.get(d.uid);if(!meta)return;networkDrops.delete(d.uid);const collectingState=state,root=world.root;
+      // Hiện "+n món đồ" NGAY LẬP TỨC (optimistic), không chờ server 1-2s. Nếu server từ chối thì hiện lại đồ.
+      feedback(meta.drop.item,meta.drop.count);
       void perform<{item:string;count:number}>('claimDrop',{ownerId:meta.drop.ownerId,id:meta.drop.id}).then(result=>{
         if(state!==collectingState||world.root!==root||visiting)return;
-        if(result)feedback(result.item,result.count);else if(meta.drop.expiresAt>Date.now())spawnNetworkDrop(meta.drop,meta.actor);
+        if(!result&&meta.drop.expiresAt>Date.now())spawnNetworkDrop(meta.drop,meta.actor);
       });
     }else if(change(()=>M.addItem(state,d.item,d.count)))feedback(d.item,d.count);
   },
