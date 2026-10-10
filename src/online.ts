@@ -83,6 +83,14 @@ export function initOnline(game:GameBridge) {
     return d<18?home:'wild';
   }
   let sharingLoot=false;
+  // A skill's picture reaches the others twice: once relayed from the caster's browser and once from the server's own copy of the cast. Same player, same kind, within 200 ms: show it once.
+  const recentEffects=new Map<string,number>();
+  function duplicateEffect(message:{by?:string;visual?:{kind?:string;look?:string}}){
+    if(message.visual?.kind==='impact'||message.visual?.kind==='trail')return false;
+    const now=performance.now(),key=`${message.by}|${message.visual?.kind}|${message.visual?.look??''}`,last=recentEffects.get(key);
+    recentEffects.set(key,now);if(recentEffects.size>64)for(const [k,at] of recentEffects)if(now-at>1000)recentEffects.delete(k);
+    return last!==undefined&&now-last<200;
+  }
   const toggle=button(`👥 ${t('Play together')}`,()=>{render();dialog.showModal();},'social-toggle');toggle.id='online-button';const socialSlot=document.querySelector('#social-slot');if(socialSlot){socialSlot.append(toggle);toggle.classList.add('social-inline-toggle');}else document.body.append(toggle);toggle.setAttribute('aria-label',t('Play together'));
   const dialog=el('dialog','social-dialog');dialog.id='online-dialog';dialog.setAttribute('aria-label',t('Play together'));document.body.append(dialog);
   const header=el('header','social-header'),heading=el('h2','',t('Play together')),close=button('✕',()=>dialog.close(),'social-close');close.setAttribute('aria-label',t('Close online menu'));header.append(heading,close);
@@ -290,6 +298,7 @@ export function initOnline(game:GameBridge) {
       else if(message.type==='dropRemove'&&message.id)game.removeNetworkDrop(message.id);
       else if(message.type==='dropClaimed')game.removeNetworkDrop(message.id);
       else if(message.type==='dropReleased')game.releaseNetworkDrop(message.id);
+      else if(message.type==='hp'&&Number.isFinite(message.hp))game.applyLiveHp(message.hp,Number(message.hurt)||0);
       else if(message.type==='healthResult')game.applyAuthorityHealth(message.delta||0,!!message.died);
       else if(message.type==='decoyHp'&&Number.isFinite(message.id)&&Number.isFinite(message.hp))game.applyDecoyHp(message.id,message.hp,String(message.kind),Number(message.x)||0,Number(message.z)||0);
       else if(typeof message.type==='string'&&message.type.startsWith('dg'))game.dungeonMessage?.(message);
@@ -304,7 +313,7 @@ export function initOnline(game:GameBridge) {
         else{game.setVisiting(null);if((message as {toCommon?:boolean}).toCommon){zone='common';const hostName=players.get(wasVisiting||'')?.name||'';announce(hostName?`Đã rời nhà của ${hostName} nè. Vào cổng lần nữa là về nhà của bạn.`:'Đã rời nhà bạn thăm. Vào cổng lần nữa là về nhà của bạn.');}else zone=null;}
         renderPlayers();if(!(message as {toCommon?:boolean}).toCommon){if(visiting)announce(`Chào mừng tới nhà của ${(message.home as Home)?.name||''} nè! Ra khỏi cổng là về khu vực chung.`);else announce('Back in your garden');}if(dialog.open)render();
       }else if(message.type==='home'&&message.home?.id===visiting)game.setVisiting(message.home.name,{discovered:message.home.discovered,plots:message.home.plots,decorations:message.home.decorations,farm:message.home.farm,helper:message.home.helper,friends:message.home.friends} as Partial<SaveState>);
-      else if(message.type==='effect'){if(message.visual)game.applyRemoteEffect(message.visual);else world().burst(message.x,message.z,message.color,8);if(message.by&&message.effect==='basic')world().triggerRemoteAttack(message.by);}
+      else if(message.type==='effect'){if(message.visual&&duplicateEffect(message))return;if(message.visual)game.applyRemoteEffect(message.visual);else world().burst(message.x,message.z,message.color,8);if(message.by&&message.effect==='basic')world().triggerRemoteAttack(message.by);}
       else if(message.type==='party'){party=message.code;announce('Party code: {code}',{code:party||''});if(dialog.open)render();}
       else if(message.type==='error'){if(chatMatches(message.requestId,connection))releaseChat();if(!message.requestId){chatReady=!!chatRoom&&connection.readyState===WebSocket.OPEN;refreshChatControls();}if(restoring&&fallbackJoin){desiredParty=null;restoring=false;joined(fallbackJoin);}announce(message.message||'That action was unavailable.');}
     });
