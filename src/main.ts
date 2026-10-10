@@ -1151,7 +1151,19 @@ function hit(e:Enemy,damage:number,stun=0,impact?:CombatHit,remote=false,hazard=
   if(e.hp<=0||(visiting&&!remote))return;
   // Vault creatures are fought in this browser, online too (a party member's hit goes to the run's host instead).
   const vault=!!dungeonApi?.owns(e);if(vault&&!dungeonApi!.mayDamage(e,damage,stun))return;
-  if(!vault&&!ctfApi?.owns(e)&&!rescueApi?.owns(e)){if(actionHandler)return;if(!remote&&network.hit?.(e.id,damage,stun,impact))return;}// Flag Rush heroes (ctf.ts) too
+  if(!vault&&!ctfApi?.owns(e)&&!rescueApi?.owns(e)){
+    if(actionHandler)return;
+    // Online: client-side prediction — hiện damage + trừ HP NGAY để đồng bộ với đòn đánh.
+    // Server vẫn authoritative, sẽ reconcile HP chính xác qua ENTITY_DAMAGED sau.
+    if(!remote&&network.hit?.(e.id,damage,stun,impact)){
+      const hpBefore=e.hp;world.damageEnemy(e,damage,stun,hazard);combatHud.noteHit(e);world.hitFeedback(e,e.driver?Math.round(hpBefore-e.hp):damage,!!impact?.critical);if(!hazard||impact)tone(impact?.critical?'crit':'hit');
+      if(impact?.lift&&e.hp>0)world.knockUpEnemy(e,impact.lift,.75);
+      if(impact?.knock&&e.hp>0)world.knockEnemy(e,impact.direction.x,impact.direction.z,impact.knock);
+      (e as unknown as {predictedAt?:number}).predictedAt=Date.now();
+      // Không gọi grantDefeat ở đây — chờ server báo ENTITY_DIED mới tính (tránh giết 2 lần).
+      return;
+    }
+  }// Flag Rush heroes (ctf.ts) too
   const hpBefore=e.hp;world.damageEnemy(e,damage,stun,hazard);combatHud.noteHit(e);world.hitFeedback(e,e.driver?Math.round(hpBefore-e.hp):damage,!!impact?.critical);if(!hazard||impact)tone(impact?.critical?'crit':'hit');
   if(impact?.lift&&e.hp>0)world.knockUpEnemy(e,impact.lift,.75);
   if(impact?.knock&&e.hp>0)world.knockEnemy(e,impact.direction.x,impact.direction.z,impact.knock);
