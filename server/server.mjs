@@ -166,7 +166,7 @@ export async function createGameServer(options = {}) {
     if(committed.reply.replayed)return;
     for(const changed of committed.accounts){
       const account=accounts.get(changed.id),peer=peers.get(changed.id);
-      if(peer)send(peer.socket,{type:'profile',profile:account.profile,revision:account.profileRevision,authorityVersion:1});
+      if(peer)send(peer.socket,{type:'profile',profile:combatAuthority.withLiveHp(peer,account.profile),revision:account.profileRevision,authorityVersion:1});
       for(const visitor of peers.values())if(visitor.visit===account.id)send(visitor.socket,{type:'home',home:publicHome(account)});
     }
     const result=committed.reply.result;
@@ -215,7 +215,7 @@ export async function createGameServer(options = {}) {
     const current = peers.get(room.host);
     const active = available.filter(peer => peer.active);
     const next = current?.active && room.members.has(room.host) ? room.host : (active[0] || available[0])?.account.id || null;
-    if (room.host !== next) { room.host = next; broadcast(room, { type: 'authority', host: next, enemies: room.enemies, environment:room.environment, epoch: ++room.epoch }); }
+    if (room.host !== next) { room.host = next; broadcast(room, { type: 'authority', host: next, environment:room.environment, epoch: ++room.epoch }); }
   }
   function leave(peer) {
     const room = rooms.get(peer.room);
@@ -310,7 +310,10 @@ export async function createGameServer(options = {}) {
       checkAccess();
       const peer=peers.get(account.id);
       if(peer&&(HEALTH_ACTIONS.has(data.type)||data.type==='upgrade'&&data.payload.kind==='health'||data.type==='environmentResource'&&peer.planet==='jungle'))await combatAuthority.flushPeerHealth(peer);
-      return respond(response,200,await executeAction(account.id,data,{checkAccess}));
+      // A drop shown from a kill's preview becomes a database row when that kill commits: a claim waits for it.
+      if(data.type==='claimDrop'&&typeof data.payload.ownerId==='string')await Promise.race([combatAuthority.idle(data.payload.ownerId),new Promise(resolve=>setTimeout(resolve,1500))]);
+      const reply=await executeAction(account.id,data,{checkAccess}),live=peers.get(account.id);
+      return respond(response,200,live&&reply?.profile?{...reply,profile:combatAuthority.withLiveHp(live,reply.profile)}:reply);
     }
     if(route==='drops'&&method==='GET'){
       const peer=peers.get(account.id),now=Date.now();
@@ -404,7 +407,7 @@ export async function createGameServer(options = {}) {
           const combat=combatAuthority.engineFor(peer).sim;
           peer.poseAt = now; if (peer.planet !== 'home' || peer.visit) peer.tripAt = now; const y = number(message.y, 0, -30, 50), dog = !peer.visit && account.profile.farm?.animals?.find(a => a.kind === 'dog');
           // A guard dog follows its explorer only away from the safe village (guard-dog.ts); its breed is all others need.
-          peer.pose = { x, z, y, dog: dog && dogFollows(peer.planet, { x, z, y }) ? Game.coatOf(dog) : null, facing: number(message.facing, 0, -100, 100), moving: message.moving === true, hp: account.profile.hp, maxHp: Game.maxHp(account.profile),visual:{size:combat.visualScale>1?combat.visualScale:Game.activeStats(account.profile).sizeScale,stealth:combat.statuses.stealth>0,shield:combat.statuses.shield>0,flight:combat.statuses.flight>0?1.7:0,bat:combat.statuses.bats>0},block:combat.statuses.block>0,decoys:combatAuthority.decoys(peer) };
+          peer.pose = { x, z, y, dog: dog && dogFollows(peer.planet, { x, z, y }) ? Game.coatOf(dog) : null, facing: number(message.facing, 0, -100, 100), moving: message.moving === true, hp: Math.round(combatAuthority.liveHp(peer)), maxHp: Game.maxHp(account.profile),visual:{size:combat.visualScale>1?combat.visualScale:Game.activeStats(account.profile).sizeScale,stealth:combat.statuses.stealth>0,shield:combat.statuses.shield>0,flight:combat.statuses.flight>0?1.7:0,bat:combat.statuses.bats>0},block:combat.statuses.block>0,decoys:combatAuthority.decoys(peer) };
           broadcastPose(room, peer);
         } else if (message.type === 'dm') {
           // A private message to a friend, online or not: it lands in their guest diary (and pops up if they are playing).
