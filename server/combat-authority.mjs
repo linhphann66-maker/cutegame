@@ -23,7 +23,18 @@ import {grantColossusReward} from '../src/colossus-rewards.ts';
 const dist=(a,b)=>Math.hypot(a.x-b.x,a.z-b.z);
 const finite=(value,fallback=0,min=-160,max=160)=>Number.isFinite(value)?Math.max(min,Math.min(max,value)):fallback;
 const snapshot=enemy=>{const {roster,home,changedAt,deadUntil,generation,pending,contributors,scaled,damageAt,cast,nextCastAt,hostPhase,hostAttackCount,combatAttacks,lastHitAt,...publicState}=enemy;return {...publicState,chaseGrace:Math.max(0,Math.min(4,((lastHitAt||0)+4000-Date.now())/1000))};};
+// Network tuning (see wire()/streamMonsters()). A creature is only streamed to explorers who can plausibly see it.
+const NEAR_IN=75,NEAR_OUT=95,BOSS_NEAR=140,RESYNC_MS=2000,MAX_BUFFER=384*1024,STREAM_MS=100;
+const roundWire=(key,value)=>typeof value==='number'&&!Number.isInteger(value)?Math.round(value*100)/100:value;
+const WIRE_KEYS=['id','type','x','z','hp','maxHp','respawn','phase','facing','lift','boss','phaseTime','stun','statuses','cooldown','targetX','targetZ','bossStage','skill','attackCount','skillCount','telegraphs','skillEffects','spinTick','damage','shots','titanAttacks','titanLift','chaseGrace'];
+/** The slim form of a creature that crosses the network: only what world.ts applyEnemySnapshots reads, numbers rounded. */
+const wire=enemy=>{const full=snapshot(enemy),out={};for(const key of WIRE_KEYS)if(full[key]!==undefined)out[key]=full[key];
+  if(out.hp<=0&&Number.isFinite(out.respawn))out.respawn=Math.ceil(out.respawn); // a dead creature's countdown is sent once a second, not on every tick
+  if(Number.isFinite(out.chaseGrace))out.chaseGrace=Math.round(out.chaseGrace*10)/10;
+  return out;};
 const STATUS=['fear','charm','slow','blind','sheep','taunt'];
+/** A small seeded random generator: the loot preview and the committed loot of one kill use the same seed, so they roll alike. */
+export const lootRng=seed=>()=>{seed=(Math.imul(seed^(seed>>>15),1|seed)+0x6D2B79F5)>>>0;let t=seed;t=Math.imul(t^(t>>>15),1|t);t=(t+Math.imul(t^(t>>>7),61|t))^t;return ((t^(t>>>14))>>>0)/4294967296;};
 
 /** The browser host animates navigation; the server owns HP, skill timing, stats, kills and rewards. */
 export function createCombatAuthority({store,peers,rooms,remember,send,broadcast,onDeath=()=>{},onError=()=>{},colossusClock}){
@@ -42,7 +53,7 @@ export function createCombatAuthority({store,peers,rooms,remember,send,broadcast
           // A successful commit may outlive its connection. Receipt replay has no changed
           // records, but connected peers still need the persisted HP and life metadata.
           if(committed.reply.replayed)committed.accounts=(await Promise.all([...new Set([actorId,...relatedIds])].map(id=>store.get(id)))).filter(Boolean);
-          committed.accounts.forEach(value=>{const current=remember(value),peer=peers.get(value.id);if(peer)send(peer.socket,{type:'profile',profile:current.profile,revision:current.profileRevision,authorityVersion:1});});
+          committed.accounts.forEach(value=>{const current=remember(value),peer=peers.get(value.id);if(peer)send(peer.socket,{type:'profile',profile:withLiveHp(peer,current.profile,type==='health'&&value.id===actorId),revision:current.profileRevision,authorityVersion:1});});
           return committed;
         }catch(error){if(error.status===409&&retry<4)continue;throw error;}
       }
@@ -51,17 +62,61 @@ export function createCombatAuthority({store,peers,rooms,remember,send,broadcast
   function state(room){if(!room.combat){const planet=room.id.split(':').at(-1),environment=new EnvironmentSimulation(createEnvironmentLayout(planet));environment.time=Date.now()/1000;environment.weather.time=environment.time;room.combat={planet,roster:new Map(enemyRoster(planet).map(e=>[e.id,e])),enemies:new Map(),environment,id:randomUUID(),at:Date.now(),lastBroadcast:0,lastMonsterBroadcast:0};room.combat.scale=Game.hardScale(peers.get(room.host)?.account.profile);spawnRoomMonsters(room.combat);}return room.combat;}
   /** Đẩy snapshot quái mới nhất vào room.enemies để gửi cho client mới vào (joined). */
   function snapshotRoom(room){publish(room);return room.enemies;}
-  function publish(room){
-    const now=Date.now();
-    for(const enemy of state(room).enemies.values())if(enemy.combatAttacks){
-      enemy.titanAttacks=enemy.combatAttacks.filter(c=>!c.done&&c.attack).map(c=>structuredClone(c.attack));
-      const pending=enemy.combatAttacks.find(c=>!c.done&&now<c.startsAt);
-      if(pending){enemy.phase='windup';enemy.phaseTime=(pending.startsAt-now)/1000;enemy.skill=pending.skill;enemy.telegraphs=pending.marks.map(mark=>({...mark}));}
-    }
-    room.enemies=[...state(room).enemies.values()].map(snapshot);
+  /** Copies a creature's running boss casts into the fields the client draws (titanAttacks, windup telegraphs). */
+  function decorate(enemy,now){
+    if(!enemy.combatAttacks)return;
+    enemy.titanAttacks=enemy.combatAttacks.filter(c=>!c.done&&c.attack).map(c=>structuredClone(c.attack));
+    const pending=enemy.combatAttacks.find(c=>!c.done&&now<c.startsAt);
+    if(pending){enemy.phase='windup';enemy.phaseTime=(pending.startsAt-now)/1000;enemy.skill=pending.skill;enemy.telegraphs=pending.marks.map(mark=>({...mark}));}
   }
-  function health(room,enemy,impact){publish(room);broadcast(room,{...snapshot(enemy),type:'ENTITY_DAMAGED',targetId:enemy.id,currentHp:Math.max(0,enemy.hp),damageDealt:impact&&Number.isFinite(impact.amount)?impact.amount:0,enemyType:enemy.type,impact,...(impact?{impactId:randomUUID()}:{})});}
-  const aliveTargets=room=>[...room.members].map(id=>peers.get(id)).filter(p=>p&&p.active&&!p.visit&&p.account.profile.hp>0&&!inSafeZone(p.pose,p.planet));
+  /** room.enemies: the full slim roster, for a joiner (joined/authority messages). Per-tick streaming is streamMonsters. */
+  function publish(room){
+    const now=Date.now(),list=[];
+    for(const enemy of state(room).enemies.values()){decorate(enemy,now);list.push(wire(enemy));}
+    room.enemies=list;
+  }
+  /** Sends one message to the explorers within `radius` of a point (everyone when no point); visitors in a friend's garden do not fight here. */
+  function broadcastNear(room,at,payload,radius=BOSS_NEAR){
+    const text=JSON.stringify(payload);
+    for(const id of room.members){const peer=peers.get(id);if(!peer||peer.visit)continue;if(at&&dist(peer.pose,at)>radius)continue;send(peer.socket,text);}
+  }
+  /**
+   * A creature's health changed. Only the facts the client applies (world.ts applyAuthoritativeEnemyHealth) travel, and only
+   * to explorers near it; before, every hit rebuilt and re-sent the whole room's creatures.
+   */
+  function health(room,enemy,impact){
+    decorate(enemy,Date.now());const full=wire(enemy);
+    broadcastNear(room,enemy,{id:enemy.id,hp:full.hp,maxHp:full.maxHp,damage:full.damage,respawn:full.respawn,chaseGrace:full.chaseGrace,statuses:full.statuses,stun:full.stun,type:'ENTITY_DAMAGED',targetId:enemy.id,currentHp:Math.max(0,enemy.hp),damageDealt:impact&&Number.isFinite(impact.amount)?impact.amount:0,enemyType:enemy.type,impact,...(impact?{impactId:randomUUID()}:{})},enemy.boss||enemy.roster?.titan?Infinity:BOSS_NEAR);
+  }
+  /**
+   * The 10 Hz creature stream. Per explorer: only creatures within NEAR_IN (NEAR_OUT once known; bosses further), and only
+   * those whose slim form changed since that explorer last got it (a full resync every RESYNC_MS covers loss and the
+   * client's own prediction). A slow socket (bufferedAmount) skips the frame instead of queueing stale positions
+   * in front of damage and loot messages.
+   */
+  function streamMonsters(room,s,now){
+    const resync=now-(s.lastResync||0)>=RESYNC_MS;if(resync)s.lastResync=now;
+    const texts=new Map(),textOf=enemy=>{let text=texts.get(enemy.id);if(text===undefined){decorate(enemy,now);text=JSON.stringify(wire(enemy),roundWire);texts.set(enemy.id,text);}return text;};
+    for(const id of room.members){
+      const peer=peers.get(id);if(!peer||peer.visit)continue;
+      if(peer.monsterRoom!==room.id){peer.monsterRoom=room.id;peer.monsterSeen=new Map();}
+      const seen=peer.monsterSeen;
+      if(!peer.active&&!resync)continue;
+      if(peer.socket.bufferedAmount>MAX_BUFFER){seen.clear();continue;}
+      const parts=[];
+      for(const enemy of s.enemies.values()){
+        const d=dist(peer.pose,enemy),known=seen.has(enemy.id),big=enemy.boss||enemy.roster?.titan;
+        if(!(d<(known?NEAR_OUT:NEAR_IN)||big&&d<BOSS_NEAR*(known?1.3:1))){if(known)seen.delete(enemy.id);continue;}
+        const text=textOf(enemy),last=seen.get(enemy.id);
+        if(!resync&&last?.text===text)continue;
+        // A creature just wandering about changes a little on every tick, and the client glides between positions anyway: 3 Hz is plenty. Fighting ones (chase, windup, hit) stay at 10 Hz.
+        if(!resync&&last&&enemy.phase==='idle'&&enemy.hp>0&&now-last.at<300)continue;
+        seen.set(enemy.id,{text,at:now});parts.push(text);
+      }
+      if(parts.length)send(peer.socket,`{"type":"MONSTERS_UPDATE","monsters":[${parts.join(',')}]}`);
+    }
+  }
+  const aliveTargets=room=>[...room.members].map(id=>peers.get(id)).filter(p=>p&&p.active&&!p.visit&&liveHp(p)>0&&!inSafeZone(p.pose,p.planet));
   const randomFor=seed=>()=>{seed=(Math.imul(seed,1664525)+1013904223)>>>0;return seed/4294967296;};
   /**
    * Boss tung skill đặc biệt: SERVER tự chọn thời điểm (thay cho host-client báo windup).
@@ -87,7 +142,7 @@ export function createCombatAuthority({store,peers,rooms,remember,send,broadcast
   }
   function hurtPlayer(peer,amount,source='melee'){
     const e=engineFor(peer),now=Date.now();// Nothing hurts an explorer standing in the safe zone round the cottage (safe-zone.ts), whatever the host reports.
-    if(peer.visit||!peer.active||peer.account.profile.hp<=0||inSafeZone(peer.pose,peer.planet)||now-e.damageAt<550||e.sim.invulnerable||source==='melee'&&e.sim.statuses.flight>0)return;
+    if(peer.visit||!peer.active||liveHp(peer)<=0||inSafeZone(peer.pose,peer.planet)||now-e.damageAt<550||e.sim.invulnerable||source==='melee'&&e.sim.statuses.flight>0)return;
     e.damageAt=now;const defense=Game.defense(combatProfile(peer))+e.sim.defenseBonus+(e.sim.statuses.armor>0?80:0);hp(peer,-Math.max(1,Math.round(amount*60/(defense+60))),source);
   }
   function hurtEnemyTarget(peer,enemy,multiplier,source='melee'){
@@ -112,7 +167,7 @@ export function createCombatAuthority({store,peers,rooms,remember,send,broadcast
   function decoys(peer){return peer.visit||!peer.active?[]:shareableDecoys(engineFor(peer).sim.decoys(),peer.pose);}
   /** A Colossus blow: the same gates as hurtPlayer, through only a quarter of the defence (colossusDamage). */
   function hurtColossus(peer,multiplier,factor,roll){
-    const e=engineFor(peer),now=Date.now();if(peer.visit||!peer.active||peer.account.profile.hp<=0||inSafeZone(peer.pose,peer.planet)||now-e.damageAt<550||e.sim.invulnerable)return false;
+    const e=engineFor(peer),now=Date.now();if(peer.visit||!peer.active||liveHp(peer)<=0||inSafeZone(peer.pose,peer.planet)||now-e.damageAt<550||e.sim.invulnerable)return false;
     e.damageAt=now;const defense=Game.defense(combatProfile(peer))+e.sim.defenseBonus+(e.sim.statuses.armor>0?80:0);hp(peer,-colossusDamage(COLOSSUS_STATS.atk,multiplier,defense,factor,roll),'melee');return true;
   }
   function updateCast(room,enemy,dt,now){
@@ -162,12 +217,12 @@ export function createCombatAuthority({store,peers,rooms,remember,send,broadcast
     room.killed.add(enemy.id);health(room,enemy);broadcast(room,{type:'ENTITY_DIED',id:enemy.id,targetId:enemy.id,by:contributors,eventId:requestId});colossus.killed(room,enemy,killer.account.id);
     // Đồ rớt: tính trước bằng profile trong memory rồi broadcast NGAY, không chờ DB transaction.
     // Nếu DB fail thì gửi dropRemove để thu hồi.
-    let previewDrops=[];
+    let previewDrops=[];const lootSeed=(Math.random()*0xffffffff)>>>0;
     try{
       const killerProfile=Game.parseSave(JSON.stringify(killer.account.profile));
       if(killerProfile){
         const bonus=Game.scaleReward(state(room).scale);
-        const previewLoot=enemy.type===COLOSSUS_TYPE?grantColossusReward(killerProfile,true,Math.random,false,bonus):Game.grantDefeat(killerProfile,enemy.type,enemy.roster.xp,enemy.boss,Math.random,false,bonus);
+        const previewLoot=enemy.type===COLOSSUS_TYPE?grantColossusReward(killerProfile,true,lootRng(lootSeed),false,bonus):Game.grantDefeat(killerProfile,enemy.type,enemy.roster.xp,enemy.boss,lootRng(lootSeed),false,bonus);
         previewDrops=previewLoot.map(item=>({id:randomUUID(),ownerId:killer.account.id,item:item.id,count:item.count,room:room.id,planet:state(room).planet,x:killPoint.x,z:killPoint.z,owner:killer.account.id,releaseAt:now+10000,expiresAt:now+30000,preview:true}));
         for(const drop of previewDrops)broadcast(room,{type:'dropSpawn',drop});
       }
@@ -176,19 +231,21 @@ export function createCombatAuthority({store,peers,rooms,remember,send,broadcast
       // The Hard bonus follows the room's creatures (the host's scale), not each contributor's own setting.
       let loot=[];const bonus=Game.scaleReward(state(room).scale);
       for(const id of contributors){const account=records.get(id);if(!account||(account.adventureEpoch||0)!==contributorEpochs.get(id))continue;const before=account.profile,profile=Game.parseSave(JSON.stringify(account.profile));if(!profile)continue;
-        const rolled=enemy.type===COLOSSUS_TYPE?grantColossusReward(profile,id===killer.account.id,Math.random,false,bonus):Game.grantDefeat(profile,enemy.type,enemy.roster.xp,enemy.boss,Math.random,false,bonus);if(id===killer.account.id)loot=rolled;
+        const rolled=enemy.type===COLOSSUS_TYPE?grantColossusReward(profile,id===killer.account.id,lootRng(lootSeed),false,bonus):Game.grantDefeat(profile,enemy.type,enemy.roster.xp,enemy.boss,lootRng(lootSeed),false,bonus);if(id===killer.account.id)loot=rolled;
         if(execute&&id===killer.account.id&&(account.lifeEpoch||0)===killerEpoch.life)profile.hp=Math.min(Game.maxHp(profile),profile.hp+Game.maxHp(profile)*.25);
         account.profile=profile;noteProgress(account,before,profile,now); // weekly leaderboard counters (ranking.mjs)
       }
       const owner=records.get(killer.account.id);if(!owner||(owner.adventureEpoch||0)!==killerEpoch.adventure)return {enemyId:enemy.id,drops:[],execute:false};owner.drops=(owner.drops||[]).filter(d=>d.expiresAt>now);
-      const drops=loot.map(item=>({id:randomUUID(),ownerId:owner.id,item:item.id,count:item.count,room:room.id,planet:state(room).planet,x:killPoint.x,z:killPoint.z,owner:owner.id,releaseAt:now+10000,expiresAt:now+30000}));owner.drops.push(...drops);
+      // The same seed gives the same loot as the preview: reuse its drop ids, so the item already on the ground just becomes real.
+      const drops=loot.map((item,index)=>({id:previewDrops[index]&&previewDrops[index].item===item.id&&previewDrops[index].count===item.count&&previewDrops[index].ownerId===owner.id?previewDrops[index].id:randomUUID(),ownerId:owner.id,item:item.id,count:item.count,room:room.id,planet:state(room).planet,x:killPoint.x,z:killPoint.z,owner:owner.id,releaseAt:now+10000,expiresAt:now+30000}));owner.drops.push(...drops);
       return {enemyId:enemy.id,drops,execute};
     },requestId).then(committed=>{
       if(!committed)throw new Error('Missing killer');enemy.pending=false;
       // Thu hồi preview drops rồi broadcast drops thật từ DB (tránh trùng).
-      for(const drop of previewDrops)broadcast(room,{type:'dropRemove',id:drop.id});
-      for(const drop of committed.reply.result.drops)broadcast(room,{type:'dropSpawn',drop});
-      if(execute&&committed.reply.result.execute)send((peers.get(killer.account.id)||killer).socket,{type:'executeResult',id:enemy.id,requestId,ok:true,profile:committed.reply.profile,revision:committed.reply.revision});
+      const real=committed.reply.result.drops,keep=new Set(real.map(drop=>drop.id)),shown=new Set(previewDrops.map(drop=>drop.id));
+      for(const drop of previewDrops)if(!keep.has(drop.id))broadcast(room,{type:'dropRemove',id:drop.id});
+      for(const drop of real)if(!shown.has(drop.id))broadcast(room,{type:'dropSpawn',drop});
+      if(execute&&committed.reply.result.execute)send((peers.get(killer.account.id)||killer).socket,{type:'executeResult',id:enemy.id,requestId,ok:true,profile:withLiveHp(peers.get(killer.account.id)||killer,committed.reply.profile),revision:committed.reply.revision});
       if(enemy.type==='magmaslime')for(const [i,minion] of [...state(room).enemies.values()].filter(e=>e.type==='minislime'&&e.hp<=0&&!e.pending).slice(0,3).entries()){minion.x=enemy.x+Math.cos(i*Math.PI*2/3)*.9;minion.z=enemy.z+Math.sin(i*Math.PI*2/3)*.9;minion.hp=minion.maxHp;minion.deadUntil=0;minion.respawn=0;minion.generation++;health(room,minion);}
     }).catch(()=>{enemy.pending=false;enemy.hp=Math.max(1,enemy.hp);room.killed.delete(enemy.id);health(room,enemy);
       // DB fail: thu hồi preview drops đã broadcast.
@@ -212,6 +269,37 @@ export function createCombatAuthority({store,peers,rooms,remember,send,broadcast
     const last=engine.healthEvents.at(-1);
     if(last&&last.adventure===context.adventure&&last.life===context.life&&last.planet===peer.planet&&Math.sign(last.amount)===Math.sign(amount)&&now-last.at<100)last.amount+=amount;
     else engine.healthEvents.push({...context,amount,source,at:now,planet:peer.planet,x:peer.pose.x,z:peer.pose.z});
+    if(amount<0)engine.hurt=(engine.hurt||0)-amount;
+    engine.hpDirty=true;
+    // Dead as far as the server's own count goes: settle it now instead of at the next 500 ms flush.
+    if(liveHp(peer)<=0)flushHealth(engine);
+  }
+  /**
+   * The explorer's health right now: the saved hp plus the damage and healing the server has already seen but not yet
+   * committed (a commit is a database write). Everything the client is told about hp and everything that decides who
+   * may be hit uses this, so damage shows at once instead of after the flush.
+   */
+  function liveHp(peer,base=peer.account.profile.hp,skipPending=false){
+    const engine=engines.get(peer.account.id);if(!engine)return base;
+    const account=peer.account,max=Game.maxHp(account.profile);let value=base;
+    const valid=event=>event.adventure===(account.adventureEpoch||0)&&event.life===(account.lifeEpoch||0)&&event.at>=(account.healthBoundaryAt||0);
+    for(const list of [skipPending?[]:engine.pendingHealth?.events??[],engine.healthEvents])for(const event of list)if(valid(event))value=Math.max(0,Math.min(max,value+event.amount));
+    return value;
+  }
+  const withLiveHp=(peer,profile,skipPending=false)=>{if(!peer||!profile)return profile;const value=liveHp(peer,profile.hp,skipPending);return value===profile.hp?profile:{...profile,hp:value};};
+  /** Tells the explorer's browser its live hp (and how much it just lost, for the hurt flash) within one tick of the hit. */
+  function pushHp(engine,now){
+    const peer=engine.peer;if(!engine.hpDirty||peers.get(peer.account.id)!==peer)return;
+    const hurt=engine.hurt||0;if(!hurt&&now-(engine.hpPushAt||0)<250)return;
+    engine.hpDirty=false;engine.hurt=0;engine.hpPushAt=now;
+    send(peer.socket,{type:'hp',hp:Math.round(liveHp(peer)*10)/10,max:Game.maxHp(peer.account.profile),hurt:Math.round(hurt)});
+  }
+  /** Skill casts count towards quests, but a database write per cast was the busiest write of all: they are saved in batches. */
+  function flushSkills(engine){
+    const count=engine.skillCasts||0;if(!count||engine.skillSaving)return;
+    const actorId=engine.peer.account.id;engine.skillCasts=0;engine.skillFlushAt=Date.now();engine.skillSaving=true;
+    internal(actorId,'skill',[],records=>{const s=records.get(actorId).profile;for(let i=0;i<count;i++)Game.recordEvent(s,'skill');return {count};},randomUUID(),false)
+      .catch(()=>{engine.skillCasts=(engine.skillCasts||0)+count;}).finally(()=>{engine.skillSaving=false;});
   }
   function flushHealth(engine){
     if(engine.pendingHealth?.flushing)return engine.pendingHealth.promise;
@@ -227,7 +315,7 @@ export function createCombatAuthority({store,peers,rooms,remember,send,broadcast
       return {delta,died,lifeEpoch:account.lifeEpoch||0};
     },batch.requestId,false,batch) /* bookkeeping: no event-outbox entry twice a second while hurt */.then(result=>{engine.pendingHealth=null;if(!result)return true;const live=peers.get(actorId);if(!live)return true;
       if(result.reply.result.died){resetPeer(live,{newLife:true});onDeath(live);}
-      send(live.socket,{type:'healthResult',...result.reply.result});return true;
+      const settled=result.reply.result;send(live.socket,{type:'healthResult',...settled,delta:settled.died?settled.delta:0,settled:settled.delta});return true;
     }).catch(async error=>{
       if(error.status===410){
         // The receipt was evicted: its outcome is ambiguous, so reload instead of applying old damage a second time.
@@ -279,7 +367,7 @@ export function createCombatAuthority({store,peers,rooms,remember,send,broadcast
   }
   function resetPeer(peer,{newLife=false,reason}={}){
     const engine=engineFor(peer);engine.sim.reset();
-    if(newLife||reason==='rest')engine.healthEvents=[];
+    if(newLife||reason==='rest'){engine.healthEvents=[];engine.hurt=0;}
     if(newLife){engine.reconciledLife=epoch(peer.account);engine.environment=new EnvironmentSimulation(createEnvironmentLayout(peer.planet));engine.damageAt=0;}
     if(reason==='reset'){engine.nextBasic=0;engine.nextSkill=[0,0,0,0];}
   }
@@ -291,7 +379,7 @@ export function createCombatAuthority({store,peers,rooms,remember,send,broadcast
    */
   function playerAttack(peer,msg={}){
     const room=rooms.get(peer.room);
-    if(!room||peer.visit||!peer.active||peer.account.profile.hp<=0)return;
+    if(!room||peer.visit||!peer.active||liveHp(peer)<=0)return;
     const now=Date.now(),e=engineFor(peer);
     // Idempotency: 1 cú vung chỉ tính 1 lần dù client retry/reconnect gửi lại.
     const requestId=typeof msg.requestId==='string'?msg.requestId.slice(0,80):'';
@@ -357,12 +445,12 @@ export function createCombatAuthority({store,peers,rooms,remember,send,broadcast
   }
   /** Wrapper cho tests/callsite cũ: aim về phía target rồi đi chung đường playerAttack. */
   function basic(peer,targetId){
-    if(peer.visit||!peer.active||peer.account.profile.hp<=0)return;
+    if(peer.visit||!peer.active||liveHp(peer)<=0)return;
     const room=rooms.get(peer.room);if(!room)return;
     const target=typeof targetId==='string'?state(room).enemies.get(targetId):null;
     playerAttack(peer,{angle:target?Math.atan2(target.x-peer.pose.x,target.z-peer.pose.z):(peer.pose.facing||0),weaponId:peer.account.profile.gear?.weapon||'fist',requestId:randomUUID()});
   }
-  function skill(peer,index){if(peer.visit||!peer.active||peer.account.profile.hp<=0||!Number.isInteger(index)||index<0||index>3)return;const e=engineFor(peer),now=Date.now();if(now<e.nextSkill[index])return;const profile=combatProfile(peer),dz=profile.gear.disguise,weapon=Game.weaponStats(profile),list=Game.DISGUISES[dz]?.skills||[...BASE_SKILLS,SPECIALS[weapon.special||'fist']||SPECIALS.fist];if(dz?e.sim.disguise(dz,index):e.sim.skill(index,weapon.special||'fist')){e.nextSkill[index]=now+skillCooldown(profile,index,list[index].cd,!!dz)/Math.max(.2,1+Game.activeStats(profile).haste)*1000;internal(peer.account.id,'skill',[],records=>{const s=records.get(peer.account.id).profile;Game.recordEvent(s,'skill');return {index};}).catch(()=>{});}}
+  function skill(peer,index){if(peer.visit||!peer.active||liveHp(peer)<=0||!Number.isInteger(index)||index<0||index>3)return;const e=engineFor(peer),now=Date.now();if(now<e.nextSkill[index])return;const profile=combatProfile(peer),dz=profile.gear.disguise,weapon=Game.weaponStats(profile),list=Game.DISGUISES[dz]?.skills||[...BASE_SKILLS,SPECIALS[weapon.special||'fist']||SPECIALS.fist];if(dz?e.sim.disguise(dz,index):e.sim.skill(index,weapon.special||'fist')){e.nextSkill[index]=now+skillCooldown(profile,index,list[index].cd,!!dz)/Math.max(.2,1+Game.activeStats(profile).haste)*1000;e.skillCasts=(e.skillCasts||0)+1;}}
   function environmentSnapshot(env){return {time:env.time,lamps:[...env.lamps],eclipseUntil:env.eclipseUntil,nestLevel:env.nestLevel,fireRain:env.fireRain,lightning:env.lightning,weather:env.weather.snapshot()};}
   function tick(dt=.05){
     const now=Date.now();
@@ -379,7 +467,7 @@ export function createCombatAuthority({store,peers,rooms,remember,send,broadcast
         else{enemy.hp=Math.max(0,enemy.hp-strike.amount);if(enemy.hp===0){enemy.deadUntil=now+enemy.roster.respawn*1000;enemy.respawn=enemy.roster.respawn;enemy.shots=[];enemy.titanAttacks=[];enemy.combatAttacks=[];enemy.cast=null;}health(room,enemy);}
       }
       const dragon=[...s.enemies.values()].find(e=>e.type==='dragon');if(dragon&&step.dragonSummon){dragon.hp=dragon.maxHp;dragon.deadUntil=0;dragon.respawn=0;dragon.statuses={};dragon.stun=0;dragon.phase='idle';dragon.cast=null;dragon.combatAttacks=[];health(room,dragon);}if(dragon&&step.dragonDismiss){dragon.hp=0;dragon.deadUntil=Infinity;dragon.respawn=999999;dragon.cast=null;dragon.combatAttacks=[];dragon.titanAttacks=[];dragon.shots=[];dragon.skillEffects=[];dragon.telegraphs=[];health(room,dragon);}
-      colossus.tick(room,s,dt,{targets:()=>aliveTargets(room),hurt:hurtColossus,hurtTrue:(peer,amount)=>{if(!peer.visit&&peer.active&&peer.account.profile.hp>0)hp(peer,-amount,'hazard');}});
+      colossus.tick(room,s,dt,{targets:()=>aliveTargets(room),hurt:hurtColossus,hurtTrue:(peer,amount)=>{if(!peer.visit&&peer.active&&liveHp(peer)>0)hp(peer,-amount,'hazard');}});
       for(const enemy of s.enemies.values()){
         if(enemy.hp>0&&!enemy.pending&&enemy.phase==='return'&&now-(enemy.lastHitAt||0)>4000){enemy.hp=Math.min(enemy.maxHp,enemy.hp+enemy.maxHp*.3*dt);if(enemy.hp===enemy.maxHp)enemy.scaled=false;}
         updateCast(room,enemy,dt,now);
@@ -391,18 +479,21 @@ export function createCombatAuthority({store,peers,rooms,remember,send,broadcast
       // Server tự mô phỏng AI quái 20Hz (monster-sim.mjs), thay cho snapshot của host-client.
       stepMonsters(s,dt,now,{targets:()=>aliveTargets(room),hurt:(peer,enemy,mult,source)=>hurtEnemyTarget(peer,enemy,mult,source||'melee'),decoy:(peer,enemy,mult)=>hurtDecoy(peer,enemy,undefined,mult,'melee',true),cast:(enemy,skill)=>beginCast(room,enemy,skill,now)});
       // Broadcast vị trí/trạng thái quái 10Hz để client nội suy mượt.
-      if(now-s.lastMonsterBroadcast>100){s.lastMonsterBroadcast=now;publish(room);broadcast(room,{type:'MONSTERS_UPDATE',monsters:room.enemies});}
-      if(now-s.lastBroadcast>250){s.lastBroadcast=now;publish(room);broadcast(room,{type:'environment',snapshot:room.environment});}
+      if(now-s.lastMonsterBroadcast>=STREAM_MS-5){s.lastMonsterBroadcast=now;streamMonsters(room,s,now);}
+      if(now-s.lastBroadcast>250){s.lastBroadcast=now;broadcast(room,{type:'environment',snapshot:room.environment});}
       for(const peer of active){const e=engineFor(peer);e.sim.update(dt,true);e.environment.authoritative=false;e.environment.time=s.environment.time-dt;e.environment.weather.restore(weatherBefore);e.environment.fireRain=structuredClone(rainBefore);e.environment.lightning=structuredClone(lightningBefore);e.environment.lamps=new Map(s.environment.lamps);e.environment.eclipseUntil=s.environment.eclipseUntil;e.environment.dragonPhase=s.environment.dragonPhase;e.environment.nestLevel=before.nestLevel;
         if(peer.account.ridePlanet===peer.planet&&peer.account.rideUntil>now)e.environment.rideUntil=e.environment.time+(peer.account.rideUntil-now)/1000;
         const traits=Game.activeStats(peer.account.profile),hazard=e.environment.step(dt,peer.pose,{x:0,z:0},{...traits,fireResistance:traits.lavaproof?1:traits.fireResistance,flying:e.sim.statuses.flight>0||e.sim.statuses.bats>0},[]);
-        if(hazard.damage>0)hurtPlayer(peer,hazard.damage,'hazard');if(hazard.heal)hp(peer,hazard.heal,'heal');if(traits.regen>0&&peer.account.profile.hp<traits.maxHp)hp(peer,traits.regen*dt,'regen');if(atHome(peer.planet,peer.pose)&&peer.account.profile.hp<traits.maxHp)hp(peer,homeRecoveryBonus(traits.regen)*dt,'rest');
+        if(hazard.damage>0)hurtPlayer(peer,hazard.damage,'hazard');if(hazard.heal)hp(peer,hazard.heal,'heal');const current=liveHp(peer);if(traits.regen>0&&current<traits.maxHp)hp(peer,traits.regen*dt,'regen');if(atHome(peer.planet,peer.pose)&&current<traits.maxHp)hp(peer,homeRecoveryBonus(traits.regen)*dt,'rest');
 
       }
     }
-    for(const[id,engine]of engines){if((engine.pendingHealth||engine.healthEvents.length)&&now-engine.hpAt>500)flushHealth(engine);if(!peers.has(id)&&!engine.pendingHealth&&!engine.healthEvents.length&&now-engine.lastSeen>600000)engines.delete(id);}
+    for(const[id,engine]of engines){pushHp(engine,now);if(engine.skillCasts&&(now-(engine.skillFlushAt||0)>3000||!peers.has(id)))flushSkills(engine);if((engine.pendingHealth||engine.healthEvents.length)&&now-engine.hpAt>500)flushHealth(engine);if(!peers.has(id)&&!engine.pendingHealth&&!engine.healthEvents.length&&!engine.skillCasts&&!engine.skillSaving&&now-engine.lastSeen>600000)engines.delete(id);}
   }
-  const timer=setInterval(()=>{if(!stopped)try{tick(.05);}catch(error){onError(error);}},50);timer.unref();
+  // The simulation advances by the real time since the last tick (capped), so a slow tick makes creatures step further
+  // instead of the whole room running in slow motion.
+  let lastTick=Date.now();
+  const timer=setInterval(()=>{if(stopped)return;const at=Date.now(),dt=Math.max(.01,Math.min(.12,(at-lastTick)/1000));lastTick=at;try{tick(dt);}catch(error){onError(error);}},50);timer.unref();
   function bomb(peer,radius,multiplier){const room=rooms.get(peer.room);if(!room||peer.visit)return;for(const enemy of state(room).enemies.values())if(enemy.hp>0&&dist(peer.pose,enemy)<=radius+enemy.radius)hit(peer,enemy,{amount:Math.round(Game.attack(combatProfile(peer))*multiplier),critical:false,stun:.5,lift:0,knock:2,direction:{x:0,z:0}});}
-  return {basic,playerAttack,skill,hurtEnemyTarget,hurtDecoy,decoys,bomb,engineFor,state,snapshotRoom,beginCast,internal,resetPeer,flushPeerHealth,colossus,async close(){stopped=true;clearInterval(timer);for(const engine of engines.values())flushHealth(engine);await Promise.allSettled([...queues.values()]);}};
+  return {idle:id=>queues.get(id)||Promise.resolve(),liveHp,withLiveHp,basic,playerAttack,skill,hurtEnemyTarget,hurtDecoy,decoys,bomb,engineFor,state,snapshotRoom,beginCast,internal,resetPeer,flushPeerHealth,colossus,async close(){stopped=true;clearInterval(timer);for(const engine of engines.values()){flushSkills(engine);flushHealth(engine);}await Promise.allSettled([...queues.values()]);}};
 }
