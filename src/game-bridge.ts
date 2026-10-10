@@ -21,6 +21,8 @@ export interface NetworkDrop {id:string;ownerId:string;item:string;count:number;
 export interface GameBridge {
   spawnNetworkDrop(drop:NetworkDrop,actor:string):void;removeNetworkDrop(id:string):void;releaseNetworkDrop(id:string):void;clearNetworkDrops():void;
   applyAuthorityHealth(delta:number,died:boolean):void;
+  /** Live health from the server (hp), and how much was just lost (hurt, for the flash). */
+  applyLiveHp(hp:number,hurt:number):void;
   getState():SaveState;applyState(next:SaveState):void;getWorld():World;getPresence():GamePresence;
   getOfflineState():SaveState|null;setPersistence(handler:((state:SaveState)=>void)|null):void;
   setActionHandler(handler:((intent:GameIntent)=>Promise<ActionReply>)|null):void;
