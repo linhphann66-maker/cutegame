@@ -1152,8 +1152,16 @@ function hit(e:Enemy,damage:number,stun=0,impact?:CombatHit,remote=false,hazard=
   // Vault creatures are fought in this browser, online too (a party member's hit goes to the run's host instead).
   const vault=!!dungeonApi?.owns(e);if(vault&&!dungeonApi!.mayDamage(e,damage,stun))return;
   if(!vault&&!ctfApi?.owns(e)&&!rescueApi?.owns(e)){
-    if(actionHandler)return;
-    // Online: client-side prediction — hiện damage + trừ HP NGAY để đồng bộ với đòn đánh.
+    if(actionHandler){
+      // Online the server decides every hit. Here only the *feel* is predicted, the moment the swing lands: the damage number, the
+      // white flash and the sound. Health never changes locally (the server's ENTITY_DAMAGED / ENTITY_DIED / creature stream
+      // set it), so a hit the server turns down cannot leave a wrong health bar behind. predictedAt stops a second number.
+      if(remote||hazard||e.driver||visiting)return;
+      world.hitFeedback(e,damage,!!impact?.critical);combatHud.noteHit(e);if(impact)tone(impact.critical?'crit':'hit');
+      (e as unknown as {predictedAt?:number}).predictedAt=Date.now();
+      return;
+    }
+    // (older prediction path, unused while an action handler exists) client-side prediction — hiện damage + trừ HP NGAY để đồng bộ với đòn đánh.
     // Server vẫn authoritative, sẽ reconcile HP chính xác qua ENTITY_DAMAGED sau.
     if(!remote&&network.hit?.(e.id,damage,stun,impact)){
       const hpBefore=e.hp;world.damageEnemy(e,damage,stun,hazard);combatHud.noteHit(e);world.hitFeedback(e,e.driver?Math.round(hpBefore-e.hp):damage,!!impact?.critical);if(!hazard||impact)tone(impact?.critical?'crit':'hit');
@@ -1335,6 +1343,12 @@ export const gameBridge:GameBridge={
     updateHud();updateLabels();
   },
   spawnNetworkDrop,removeNetworkDrop,releaseNetworkDrop(id){for(const meta of networkDrops.values())if(meta.drop.id===id)meta.drop.releaseAt=0;},clearNetworkDrops(){networkDrops.clear();drops.clear();},
+  /** The server's live health (damage seen but not yet saved): the bar moves within one server tick of a hit. Never below 1: death is the server's call. */
+  applyLiveHp(hp,hurt){
+    if(!started||visiting||dungeonApi?.active||ctfApi?.active||rescueApi?.active||state.hp<=0||!Number.isFinite(hp))return;
+    if(hurt>0){world.hurtFeedback(hurt);tone('hurt');vibrate(60);$('#damage-flash').classList.add('active');setTimeout(()=>$('#damage-flash').classList.remove('active'),160);if(fishGame)endFishing('The fish got away when you were hit.');}
+    state.hp=Math.max(1,Math.min(M.maxHp(state),hp));updateHud();
+  },
   applyAuthorityHealth(delta,died){if(delta<0){world.hurtFeedback(-delta);tone('hurt');if(fishGame)endFishing('The fish got away when you were hit.');}if(died){visiting=null;visitHome=null;world.state=state;endFishing();resetCombat();world.build(state.planet);world.refreshPlayer();closeDialog();toast('You are safe at home.','🏡');}updateHud();},
   setNetworkHooks(hooks){network=hooks;world.networkRole=hooks.role;},
   applyRemoteHit(id,damage,stun=0,impact){const enemy=world.enemies.find(e=>e.id===id);if(enemy)hit(enemy,damage,stun,impact,true);},
