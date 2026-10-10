@@ -160,6 +160,18 @@ export function createCombatAuthority({store,peers,rooms,remember,send,broadcast
     // Báo chết NGAY LẬP TỨC (không chờ ghi DB) để client không thấy quái kẹt ở 1 máu.
     enemy.hp=0;enemy.deadUntil=Date.now()+enemy.roster.respawn*1000;enemy.respawn=enemy.roster.respawn;enemy.titanAttacks=[];enemy.shots=[];enemy.skillEffects=[];enemy.telegraphs=[];enemy.combatAttacks=[];enemy.cast=null;
     room.killed.add(enemy.id);health(room,enemy);broadcast(room,{type:'ENTITY_DIED',id:enemy.id,targetId:enemy.id,by:contributors,eventId:requestId});colossus.killed(room,enemy,killer.account.id);
+    // Đồ rớt: tính trước bằng profile trong memory rồi broadcast NGAY, không chờ DB transaction.
+    // Nếu DB fail thì gửi dropRemove để thu hồi.
+    let previewDrops=[];
+    try{
+      const killerProfile=Game.parseSave(JSON.stringify(killer.account.profile));
+      if(killerProfile){
+        const bonus=Game.scaleReward(state(room).scale);
+        const previewLoot=enemy.type===COLOSSUS_TYPE?grantColossusReward(killerProfile,true,Math.random,false,bonus):Game.grantDefeat(killerProfile,enemy.type,enemy.roster.xp,enemy.boss,Math.random,false,bonus);
+        previewDrops=previewLoot.map(item=>({id:randomUUID(),ownerId:killer.account.id,item:item.id,count:item.count,room:room.id,planet:state(room).planet,x:killPoint.x,z:killPoint.z,owner:killer.account.id,releaseAt:now+10000,expiresAt:now+30000,preview:true}));
+        for(const drop of previewDrops)broadcast(room,{type:'dropSpawn',drop});
+      }
+    }catch{previewDrops=[];}
     internal(killer.account.id,'combatKill',contributors,records=>{
       // The Hard bonus follows the room's creatures (the host's scale), not each contributor's own setting.
       let loot=[];const bonus=Game.scaleReward(state(room).scale);
@@ -173,10 +185,15 @@ export function createCombatAuthority({store,peers,rooms,remember,send,broadcast
       return {enemyId:enemy.id,drops,execute};
     },requestId).then(committed=>{
       if(!committed)throw new Error('Missing killer');enemy.pending=false;
+      // Thu hồi preview drops rồi broadcast drops thật từ DB (tránh trùng).
+      for(const drop of previewDrops)broadcast(room,{type:'dropRemove',id:drop.id});
       for(const drop of committed.reply.result.drops)broadcast(room,{type:'dropSpawn',drop});
       if(execute&&committed.reply.result.execute)send((peers.get(killer.account.id)||killer).socket,{type:'executeResult',id:enemy.id,requestId,ok:true,profile:committed.reply.profile,revision:committed.reply.revision});
       if(enemy.type==='magmaslime')for(const [i,minion] of [...state(room).enemies.values()].filter(e=>e.type==='minislime'&&e.hp<=0&&!e.pending).slice(0,3).entries()){minion.x=enemy.x+Math.cos(i*Math.PI*2/3)*.9;minion.z=enemy.z+Math.sin(i*Math.PI*2/3)*.9;minion.hp=minion.maxHp;minion.deadUntil=0;minion.respawn=0;minion.generation++;health(room,minion);}
-    }).catch(()=>{enemy.pending=false;enemy.hp=Math.max(1,enemy.hp);room.killed.delete(enemy.id);health(room,enemy);send(killer.socket,{type:'error',message:'The reward could not be saved. Please try again.'});});
+    }).catch(()=>{enemy.pending=false;enemy.hp=Math.max(1,enemy.hp);room.killed.delete(enemy.id);health(room,enemy);
+      // DB fail: thu hồi preview drops đã broadcast.
+      for(const drop of previewDrops)broadcast(room,{type:'dropRemove',id:drop.id});
+      send(killer.socket,{type:'error',message:'The reward could not be saved. Please try again.'});});
   }
   function hit(peer,enemy,impact,execute=false,hazard=false){
     const room=rooms.get(peer.room);if(!room||peer.visit||enemy.hp<=0||enemy.pending)return 0;
