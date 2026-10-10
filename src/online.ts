@@ -70,6 +70,17 @@ export function initOnline(game:GameBridge) {
   let authSubmit:HTMLButtonElement|null=null;
   const players=new Map<string,Explorer>(),rewardIds=new Set<string>(),chat:{name:string;message:string}[]=[];
   let chatRoom:string|null=null,chatDraft='',chatReady=false,chatAttempt:ChatAttempt|null=null;
+  // Hysteresis cho ranh giới vườn 18m: tránh space nhảy qua lại khi đứng gần ranh giới
+  // (server và client tính vị trí lệch nhau chút xíu gây nhấp nháy thấy/mất người chơi).
+  let lastSpace:string|null=null;
+  function computeSpace(local:{planet:string;x:number;z:number}):string{
+    if(visiting)return `home:${visiting}`;
+    if(local.planet!=='home')return 'wild';
+    const d=Math.hypot(local.x,local.z),home=`home:${account?.id}`;
+    if(lastSpace===home)return d>20?'wild':home; // đang ở nhà: ra khỏi 20m mới tính là ra ngoài
+    if(lastSpace==='wild')return d<16?home:'wild'; // đang ở ngoài: vào trong 16m mới tính là về nhà
+    return d<18?home:'wild';
+  }
   let sharingLoot=false;
   const toggle=button(`👥 ${t('Play together')}`,()=>{render();dialog.showModal();},'social-toggle');toggle.id='online-button';const socialSlot=document.querySelector('#social-slot');if(socialSlot){socialSlot.append(toggle);toggle.classList.add('social-inline-toggle');}else document.body.append(toggle);toggle.setAttribute('aria-label',t('Play together'));
   const dialog=el('dialog','social-dialog');dialog.id='online-dialog';dialog.setAttribute('aria-label',t('Play together'));document.body.append(dialog);
@@ -135,7 +146,7 @@ export function initOnline(game:GameBridge) {
     box.replaceChildren(el('h4','',t('Message')));
     const form=el('form','social-inline'),input=el('input');input.maxLength=120;input.placeholder=t('Write a short message…');input.setAttribute('aria-label',t('Message'));input.name='friend-message';
     const submit=el('button','',t('Send'));submit.type='submit';form.append(input,submit);
-    form.addEventListener('submit',event=>{event.preventDefault();const text=input.value.trim();if(!text)return;if(send({type:'dm',to:friendId,text})){input.value='';announce('Message sent.');}});
+    form.addEventListener('submit',event=>{event.preventDefault();const text=input.value.trim();if(!text)return;if(send({type:'dm',to:friendId,text})){input.value='';}});
     box.append(form);input.focus();
   }
   /** Gifts: pick things from your bag to hand a friend (server: friends only, a daily limit; it lands in their chest). */
@@ -164,10 +175,11 @@ export function initOnline(game:GameBridge) {
   function guestLine(e:GuestEntry){const what=e.what&&ITEMS[e.what]?t(ITEMS[e.what].name):'';
     return e.kind==='water'?t('{name} watered your {item}!',{name:e.name,item:what}):e.kind==='gift'?t('{name} sent you a gift: {count} {item}',{name:e.name,count:e.count??1,item:what}):e.kind==='steal'?t('{name} picked your {item}!',{name:e.name,item:what}):e.kind==='message'?`${e.name}: ${e.text??''}`:t('{name} is visiting your garden',{name:e.name});}
   const ago=(at:number)=>{const s=Math.max(0,(Date.now()-at)/1000);return s<60?t('just now'):s<3600?t('{n} min ago',{n:Math.floor(s/60)}):s<86400?t('{n} h ago',{n:Math.floor(s/3600)}):t('{n} d ago',{n:Math.floor(s/86400)});};
-  function refreshButton(){const label=account?t(status,{code:party||''}):t('Play together');toggle.textContent=socialSlot?'👥':`👥 ${label}`;toggle.dataset.badge=String(requests.length+unreadLog||'');world().friendIds=new Set(friends.map(f=>f.id));toggle.title=label;toggle.setAttribute('aria-label',t('Play together'));dialog.setAttribute('aria-label',t('Play together'));close.setAttribute('aria-label',t('Close online menu'));toggle.dataset.online=String(!!account);}
+  function isOnline(){return !!account&&socket?.readyState===WebSocket.OPEN;}
+  function refreshButton(){const label=!account?t('Play together'):!isOnline()?t('Reconnecting…'):t(status,{code:party||''});toggle.textContent=socialSlot?'👥':`👥 ${label}`;toggle.dataset.badge=String(requests.length+unreadLog||'');world().friendIds=new Set(friends.map(f=>f.id));toggle.title=label;toggle.setAttribute('aria-label',t('Play together'));dialog.setAttribute('aria-label',t('Play together'));close.setAttribute('aria-label',t('Close online menu'));toggle.dataset.online=String(isOnline());}
   function expireSession(){
     if(!account)return;game.setDungeonSender?.(null);sessionEpoch++;stopped=true;if(reconnect)clearTimeout(reconnect);if(saveTimer)clearTimeout(saveTimer);
-    clearChat();const previous=socket;socket=null;previous?.close();account=null;host=null;party=null;visiting=null;players.clear();rejectActions('Your session ended. Pending actions remain on this device.');
+    clearChat();const previous=socket;socket=null;previous?.close();account=null;host=null;party=null;visiting=null;players.clear();lastSpace=null;rejectActions('Your session ended. Pending actions remain on this device.');
     authority(null);world().clearRemotePlayers();game.setVisiting(null);game.setPersistence(null);game.setActionHandler(null);const previousOffline=offline||game.getOfflineState();if(previousOffline)game.applyState(previousOffline);offline=null;
     status='Play together';setSaveStatus('● Offline adventure restored');refreshButton();render();announce('Your online session ended. Sign in again to continue; pending online progress is kept on this device.');
   }
@@ -175,7 +187,7 @@ export function initOnline(game:GameBridge) {
   function syncRoomDifficulty(){const d=host&&host!==account?.id?players.get(host)?.difficulty:null;world().roomDifficulty=d==='easy'||d==='normal'||d==='hard'?d:null;}
   function renderPlayers(){
     syncRoomDifficulty();
-    const local=game.getPresence();const space=visiting?`home:${visiting}`:local.planet==='home'&&Math.hypot(local.x,local.z)<18?`home:${account?.id}`:'wild';
+    const local=game.getPresence();const space=computeSpace(local);lastSpace=space;
     world().updateRemotePlayers([...players.values()].filter(player=>player.id!==account?.id&&player.planet===local.planet&&(player.space==='wild'||player.space===space)));
   }
   function authority(next:string|null,enemies?:EnemyState[]){
@@ -274,6 +286,7 @@ export function initOnline(game:GameBridge) {
         else if(!message.blocked&&message.by===account?.id)announce('Crop collected. {count} visits left here today.',{count:message.remaining||0});
       }
       else if(message.type==='dropSpawn'&&message.drop)game.spawnNetworkDrop(message.drop,account!.id);
+      else if(message.type==='dropRemove'&&message.id)game.removeNetworkDrop(message.id);
       else if(message.type==='dropClaimed')game.removeNetworkDrop(message.id);
       else if(message.type==='dropReleased')game.releaseNetworkDrop(message.id);
       else if(message.type==='healthResult')game.applyAuthorityHealth(message.delta||0,!!message.died);
@@ -282,7 +295,7 @@ export function initOnline(game:GameBridge) {
       else if(message.type==='chatAck')acknowledgeChat(message.requestId,connection);
       else if(message.type==='chat'&&!restoring&&chatRoom){chat.push({name:String(message.name),message:String(message.message)});if(chat.length>60)chat.shift();if(dialog.open&&tab==='world')renderChat();else game.showNotice(`${message.name}: ${message.message}`);}
       else if(message.type==='friends'){const before=requests.length;friends=message.friends||[];requests=message.requests||[];sent=message.sent||[];visitLog=message.visitLog||visitLog;if(requests.length>before)announce('You have a new friend request!');refreshButton();if(dialog.open&&tab==='friends')render();}
-      else if(message.type==='dmSent'&&message.ok===false)announce('That message could not be delivered. Try again.');
+      else if(message.type==='dmSent'){if(message.ok===false)announce('That message could not be delivered. Try again.');else announce('Message sent.');}
       else if(message.type==='guestNotice'&&message.entry){const e=message.entry as GuestEntry;visitLog=[e,...visitLog].slice(0,30);unreadLog++;refreshButton();announce(guestLine(e));if(dialog.open&&tab==='diary'){unreadLog=0;render();}}
       else if(message.type==='visit'){
         chatReady=true;refreshChatControls();const wasVisiting=visiting;visiting=message.home?.id||null;
@@ -290,7 +303,7 @@ export function initOnline(game:GameBridge) {
         else{game.setVisiting(null);if((message as {toCommon?:boolean}).toCommon){zone='common';const hostName=players.get(wasVisiting||'')?.name||'';announce(hostName?`Đã rời nhà của ${hostName} nè. Vào cổng lần nữa là về nhà của bạn.`:'Đã rời nhà bạn thăm. Vào cổng lần nữa là về nhà của bạn.');}else zone=null;}
         renderPlayers();if(!(message as {toCommon?:boolean}).toCommon){if(visiting)announce(`Chào mừng tới nhà của ${(message.home as Home)?.name||''} nè! Ra khỏi cổng là về khu vực chung.`);else announce('Back in your garden');}if(dialog.open)render();
       }else if(message.type==='home'&&message.home?.id===visiting)game.setVisiting(message.home.name,{discovered:message.home.discovered,plots:message.home.plots,decorations:message.home.decorations,farm:message.home.farm,helper:message.home.helper,friends:message.home.friends} as Partial<SaveState>);
-      else if(message.type==='effect'){if(message.visual)game.applyRemoteEffect(message.visual);else world().burst(message.x,message.z,message.color,8);}
+      else if(message.type==='effect'){if(message.visual)game.applyRemoteEffect(message.visual);else world().burst(message.x,message.z,message.color,8);if(message.by&&message.effect==='basic')world().triggerRemoteAttack(message.by);}
       else if(message.type==='party'){party=message.code;announce('Party code: {code}',{code:party||''});if(dialog.open)render();}
       else if(message.type==='error'){if(chatMatches(message.requestId,connection))releaseChat();if(!message.requestId){chatReady=!!chatRoom&&connection.readyState===WebSocket.OPEN;refreshChatControls();}if(restoring&&fallbackJoin){desiredParty=null;restoring=false;joined(fallbackJoin);}announce(message.message||'That action was unavailable.');}
     });
@@ -317,6 +330,34 @@ export function initOnline(game:GameBridge) {
     clearChat();stopped=true;if(reconnect)clearTimeout(reconnect);if(saveTimer)clearTimeout(saveTimer);socket?.close();socket=null;account=null;host=null;party=null;visiting=null;players.clear();authority(null);world().clearRemotePlayers();
     game.setVisiting(null);game.setPersistence(null);game.setActionHandler(null);const state=offline||game.getOfflineState();if(state)game.applyState(state);setSaveStatus('● Saved on this device');status='Play together';refreshButton();render();announce('Your offline adventure is restored.');
   }
+  /** DevTools (F12) bị mở → tạm ngắt online, chuyển về chơi offline (kiểu bản web gốc).
+   *  Không ban acc, chỉ ngắt WS. Người chơi bấm "Play together" để vào lại. */
+  function devToolsOffline(){
+    if(!socket||!account)return; // đang offline rồi thì thôi
+    clearChat();stopped=true;if(reconnect)clearTimeout(reconnect);if(saveTimer)clearTimeout(saveTimer);
+    socket?.close();socket=null;account=null;host=null;party=null;visiting=null;zone=null;players.clear();
+    authority(null);world().clearRemotePlayers();
+    game.setVisiting(null);game.setPersistence(null);game.setActionHandler(null);
+    const state=offline||game.getOfflineState();if(state)game.applyState(state);
+    setSaveStatus('● Saved on this device');status='Play together';refreshButton();render();
+    game.showNotice('🛡️ Phát hiện công cụ gỡ lỗi (F12) – tạm ngắt chơi online. Mọi dữ liệu vẫn được máy chủ kiểm tra.');
+  }
+  // Bật phát hiện DevTools ngay khi module online được khởi tạo.
+  // Cách bản web gốc: chạy lệnh `debugger` và đo thời gian — DevTools mở thì khựng >100ms.
+  // Phát hiện → tạm ngắt WS, về offline (không ban acc).
+  // Guard typeof để không vỡ trong môi trường test (VM không có setInterval).
+  if (typeof setInterval !== 'undefined' && typeof performance !== 'undefined') {
+    let lastAlert = 0;
+    const probe = Function('debugger') as () => void;
+    setInterval(() => {
+      const start = performance.now();
+      probe();
+      if (performance.now() - start > 100 && start - lastAlert > 10000) {
+        lastAlert = start;
+        devToolsOffline();
+      }
+    }, 1000);
+  }
   async function reconnectOnline(){
     const epoch=++sessionEpoch;if(reconnect)clearTimeout(reconnect);stopped=true;const previous=socket;socket=null;previous?.close();
     try{const session=await api<Session>('auth/session');if(sessionEpoch!==epoch)return;if(!session.account){expireSession();return;}begin(session);}
@@ -327,7 +368,7 @@ export function initOnline(game:GameBridge) {
   async function friendAction(action:string,id:string){try{const list=await api<{friends:Explorer[];requests:Explorer[];sent?:Explorer[]}>(`friends/${action}`,{id});friends=list.friends;requests=list.requests;sent=list.sent??sent;refreshButton();render();}catch(error){announce((error as Error).message);}}
   function renderChat(){const log=content.querySelector('.social-chat-log');if(!log)return;log.replaceChildren(...chat.slice(-30).map(entry=>{const line=el('p');line.append(el('strong','',entry.name+': '),document.createTextNode(entry.message));return line;}));log.scrollTop=log.scrollHeight;}
   function render(){
-    captureChatDraft();content.replaceChildren();tabs.replaceChildren();authSubmit=null;setNotice('');heading.textContent=t(account?'Your online world':'Play together');
+    captureChatDraft();content.replaceChildren();tabs.replaceChildren();authSubmit=null;setNotice('');heading.textContent=t(isOnline()?'Your online world':'Play together');
     if(!account){
       content.append(el('p','social-intro',t('Make a home, meet friends, and explore the same world. Your offline adventure stays saved separately.')));
       const form=el('form','social-auth');const username=labeledInput('Username','text','username'),password=labeledInput('Password','password','password');username.input.autocomplete='username';username.input.pattern='[a-zA-Z0-9_]{3,24}';username.input.minLength=3;username.input.maxLength=24;password.input.autocomplete=register?'new-password':'current-password';password.input.minLength=4;password.input.maxLength=128;
@@ -336,6 +377,14 @@ export function initOnline(game:GameBridge) {
       const submit=el('button','social-primary',t(register?'Create online adventure':'Sign in'));submit.type='submit';submit.disabled=authBusy;authSubmit=submit;form.append(submit);
       form.addEventListener('submit',async event=>{event.preventDefault();if(authBusy)return;authBusy=true;submit.disabled=true;try{begin(await api<Session>(`auth/${register?'register':'login'}`,{username:username.input.value,password:password.input.value,name:display?.value,color:game.getState().color}));}catch(error){setNotice((error as Error).message);}finally{authBusy=false;submit.disabled=false;if(authSubmit)authSubmit.disabled=false;}});
       content.append(form,button(register?'Already have an account? Sign in':'New here? Create an adventure',()=>{register=!register;render();},'social-link'),el('p','social-small',t('Accounts are stored on this game server. No email address is needed.')));return;
+    }
+    if(!isOnline()){
+      // Đã đăng nhập nhưng mất kết nối: hiện rõ trạng thái đang kết nối lại,
+      // không hiện tabs online gây nhầm lẫn.
+      content.append(el('p','social-intro',t('Connection lost. Trying to reconnect… Your progress is safe.')));
+      content.append(button(t('Reconnect now'),()=>reconnectOnline(),'social-primary'));
+      content.append(button(t('Sign out and play offline'),()=>void signOut(),'social-link'));
+      return;
     }
     for(const [id,label]of [['world','🌍 World'],['friends',`${t('👥 Friends')}${requests.length?` (${requests.length})`:''}`],['diary',`${t('📒 Guest diary')}${unreadLog?` (${unreadLog})`:''}`],['account','🏡 Account']]as const){const item=button(label,()=>{tab=id;if(id==='diary'){unreadLog=0;refreshButton();}render();});item.setAttribute('aria-pressed',String(tab===id));tabs.append(item);}
     if(tab==='world'){
