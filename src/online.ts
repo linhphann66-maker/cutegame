@@ -13,6 +13,7 @@ interface EnemyState { id:string;x:number;z:number;hp:number;maxHp:number;[key:s
 interface NetworkWorld {
   updateRemotePlayers(players:Explorer[]):void;clearRemotePlayers():void;
   setNetworkRole(role:'host'|'peer'|null):void;
+  triggerRemoteAttack(id:string):void;
   /** The host's difficulty while someone else hosts the room (creature scale, the Settings note); null otherwise. */
   roomDifficulty:Difficulty|null;
   enemySnapshots():EnemyState[];applyEnemySnapshots(enemies:EnemyState[]):void;
